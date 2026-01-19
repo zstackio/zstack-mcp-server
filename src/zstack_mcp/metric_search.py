@@ -26,8 +26,8 @@ class MetricSearchIndex:
     """监控指标搜索索引"""
     
     def __init__(self):
-        self.metrics: dict[str, MetricInfo] = {}  # name -> MetricInfo
-        self.inverted_index: dict[str, set[str]] = {}  # token -> set of metric names
+        self.metrics: dict[str, MetricInfo] = {}  # metric_key -> MetricInfo
+        self.inverted_index: dict[str, set[str]] = {}  # token -> set of metric keys
         self.namespaces: set[str] = set()
     
     def load_from_file(self, file_path: str | Path) -> None:
@@ -53,14 +53,16 @@ class MetricSearchIndex:
             # 驼峰拆分建立 tokens
             metric_info.tokens = self._split_camel_case(name)
             
-            self.metrics[name] = metric_info
+            namespace = metric_info.namespace or ""
+            metric_key = f"{namespace}::{name}"
+            self.metrics[metric_key] = metric_info
             self.namespaces.add(metric_info.namespace)
             
             # 建立倒排索引
             for token in metric_info.tokens:
                 if token not in self.inverted_index:
                     self.inverted_index[token] = set()
-                self.inverted_index[token].add(name)
+                self.inverted_index[token].add(metric_key)
     
     def _split_camel_case(self, name: str) -> list[str]:
         """
@@ -79,7 +81,9 @@ class MetricSearchIndex:
         self,
         keywords: list[str],
         namespace: Optional[str] = None,
-        limit: int = 20
+        limit: int = 20,
+        match_mode: str = "or",
+        prefer_namespaces: Optional[list[str]] = None,
     ) -> list[dict]:
         """
         搜索监控指标
@@ -88,27 +92,33 @@ class MetricSearchIndex:
             keywords: 搜索关键词列表
             namespace: 可选的命名空间过滤
             limit: 最多返回数量
+            match_mode: 关键词匹配模式，"and" 或 "or"，默认 "or"
+            prefer_namespaces: 优先排序的命名空间列表（精确匹配，大小写不敏感）
             
         Returns:
             匹配的监控指标列表
         """
         if not keywords:
             return []
+
+        mode = (match_mode or "or").lower().strip()
+        if mode not in ("and", "or"):
+            mode = "or"
         
         # 将关键词转为小写
         keywords_lower = [kw.lower() for kw in keywords]
         
-        # 找出包含所有关键词的指标（交集）
-        matched_metrics: Optional[set[str]] = None
+        matched_metrics: set[str] = set()
+        first = True
         
         for kw in keywords_lower:
             # 查找包含该关键词的所有指标
             matching_names: set[str] = set()
             
             # 1. 首先检查是否直接匹配指标名称
-            for metric_name in self.metrics.keys():
-                if kw in metric_name.lower():
-                    matching_names.add(metric_name)
+            for metric_key, metric in self.metrics.items():
+                if kw in metric.name.lower():
+                    matching_names.add(metric_key)
             
             # 2. 然后检查倒排索引中的 token
             for token, names in self.inverted_index.items():
@@ -116,35 +126,55 @@ class MetricSearchIndex:
                 if token.startswith(kw) or kw in token:
                     matching_names.update(names)
             
-            if matched_metrics is None:
-                matched_metrics = matching_names
+            if mode == "and":
+                if first:
+                    matched_metrics = matching_names
+                    first = False
+                else:
+                    matched_metrics = matched_metrics.intersection(matching_names)
             else:
-                matched_metrics = matched_metrics.intersection(matching_names)
+                matched_metrics.update(matching_names)
         
         if not matched_metrics:
             return []
         
-        # 按命名空间过滤
+        # 按命名空间过滤（支持模糊匹配）
         if namespace:
-            namespace_lower = namespace.lower()
+            namespace_lower = namespace.lower().strip()
             matched_metrics = {
                 name for name in matched_metrics
-                if self.metrics[name].namespace.lower() == namespace_lower
+                    if namespace_lower in self.metrics[name].namespace.lower()
             }
         
         # 计算匹配分数并排序
-        scored_results: list[tuple[str, float]] = []
+        prefer_map: dict[str, int] = {}
+        if prefer_namespaces:
+            for idx, ns in enumerate(prefer_namespaces):
+                ns_lower = str(ns).strip().lower()
+                if ns_lower and ns_lower not in prefer_map:
+                    prefer_map[ns_lower] = idx
+        scored_results: list[tuple[str, float, Optional[int]]] = []
         for name in matched_metrics:
             metric = self.metrics[name]
             score = self._calculate_score(metric, keywords_lower)
-            scored_results.append((name, score))
+            prefer_rank = prefer_map.get(metric.namespace.lower()) if prefer_map else None
+            scored_results.append((name, score, prefer_rank))
         
-        # 按分数降序排序
-        scored_results.sort(key=lambda x: x[1], reverse=True)
+        # 按偏好命名空间优先，再按分数降序排序
+        if prefer_map:
+            scored_results.sort(
+                key=lambda x: (
+                    1 if x[2] is None else 0,
+                    x[2] if x[2] is not None else 0,
+                    -x[1],
+                )
+            )
+        else:
+            scored_results.sort(key=lambda x: x[1], reverse=True)
         
         # 返回结果
         results = []
-        for name, score in scored_results[:limit]:
+        for name, _score, _rank in scored_results[:limit]:
             metric = self.metrics[name]
             results.append({
                 'name': metric.name,
@@ -159,6 +189,8 @@ class MetricSearchIndex:
         """计算指标与关键词的匹配分数"""
         score = 0.0
         metric_name_lower = metric.name.lower()
+        namespace_lower = metric.namespace.lower()
+        namespace_segments = [seg for seg in namespace_lower.split("/") if seg]
         
         for kw in keywords:
             # 检查指标名称是否完全等于关键词
@@ -178,6 +210,12 @@ class MetricSearchIndex:
             
             if kw in metric.description.lower():
                 score += 0.5
+
+            # namespace 参与评分（优先精确段匹配）
+            if kw in namespace_segments:
+                score += 4.0
+            elif any(seg.startswith(kw) or kw in seg for seg in namespace_segments):
+                score += 1.0
         
         # 减少冗长名称的分数
         score -= len(metric.tokens) * 0.1
@@ -186,7 +224,12 @@ class MetricSearchIndex:
     
     def get_metric(self, name: str) -> Optional[MetricInfo]:
         """获取指定指标的信息"""
-        return self.metrics.get(name)
+        if name in self.metrics:
+            return self.metrics.get(name)
+        for metric in self.metrics.values():
+            if metric.name == name:
+                return metric
+        return None
     
     def list_namespaces(self) -> list[str]:
         """列出所有命名空间"""

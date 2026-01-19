@@ -238,8 +238,12 @@ class ApiSearchIndex:
         
         if is_query:
             if api.primitive_fields:
-                result['fields'] = ", ".join(api.primitive_fields)
-            result['usage'] = "Filter: conditions=[{name,op,value}]. Ops: =,!=,>,<,>=,<=,?=(like),~=(regex),in,is null. Sort: sortBy, sortDirection."
+                result['fields'] = api.primitive_fields
+            result['usage'] = (
+                "Query: conditions=[{name,op,value}], fields is array. "
+                "Ops: =,!=,>,<,>=,<=,?=(like,use %),like(compat),~=(regex,optional),in,is null. "
+                "Sort: sortBy, sortDirection."
+            )
         
         return result
     

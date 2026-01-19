@@ -148,7 +148,14 @@ zstack-mcp
 
 **参数**:
 - `keywords` (list[str]): 搜索关键词
-- `namespace` (str, 可选): 按命名空间过滤
+- `namespace` (str, 可选): 按命名空间过滤（支持模糊匹配，如 `vm`/`host`）
+- `limit` (int, 默认 20): 最多返回数量
+- `match_mode` (str, 默认 `or`): 关键词匹配模式（`and`/`or`）
+- `prefer_namespaces` (list[str], 可选): 优先排序的命名空间列表（默认 `["ZStack/VM","ZStack/Host"]`）
+
+> 💡 提示：不确定 namespace 时可先不传，返回结果会带 namespace 值供选择
+> 💡 默认 `match_mode=or`（多关键词并集）；如需交集请显式传 `and`
+> 💡 指标名称在不同 namespace 可能重名，建议指定 `namespace` 或 `prefer_namespaces` 以确保排序优先
 
 ### 5. get_metric_data
 
@@ -157,10 +164,35 @@ zstack-mcp
 **参数**:
 - `namespace` (str): 命名空间
 - `metric_name` (str): 指标名称
-- `start_time` (str): 开始时间 (ISO 格式)
-- `end_time` (str): 结束时间
+- `start_time` (str|int, 可选): 开始时间 (ISO 或秒级时间戳)
+- `end_time` (str|int, 可选): 结束时间 (ISO 或秒级时间戳)
 - `period` (int, 默认 60): 采样周期(秒)
-- `labels` (list[str]): 标签过滤
+- `labels` (list[str]|dict, 可选): 标签过滤，如 `["VMUuid=xxx"]` 或 `{"VMUuid":"xxx"}`
+- `summary_only` (bool, 可选): 仅返回统计信息（点数/最大/最小/平均/方差/标准差）
+
+**数据量提示**:
+- 返回点数估算：`ceil((end_time - start_time) / period) * series_count`
+- `series_count` 为不同 label 组合数量；不传 `labels` 时可能返回多组序列
+- 建议通过缩短时间范围、增大 `period` 或增加 `labels` 过滤避免输出过大
+
+### 6. get_metric_summary
+
+获取监控指标的聚合 TopN（按 label_key 分组）。
+
+**参数**:
+- `namespace` (str): 命名空间
+- `metric_name` (str): 指标名称
+- `label_key` (str): 标签键，如 `VMUuid`/`HostUuid`
+- `metric_names` (list[str], 可选): 多指标合并（如 in/out）
+- `start_time` (str|int, 可选): 开始时间 (ISO 或秒级时间戳)
+- `end_time` (str|int, 可选): 结束时间 (ISO 或秒级时间戳)
+- `period` (int, 默认 60): 采样周期(秒)
+- `aggregate` (str, 默认 max): 单指标聚合方式 (max/avg/sum/min)
+- `combine` (str, 默认 sum): 多指标合并方式 (sum/avg/max/min)
+- `threshold_op` (str, 可选): 阈值比较符 (>,>=,<,<=,==,!=)
+- `threshold_value` (number, 可选): 阈值数值
+- `top_n` (int, 默认 10): 返回条数
+- `resolve_resource` (str, 可选): `vm` 或 `host`，用于解析名称
 
 ## Query API 条件语法
 
@@ -174,7 +206,7 @@ zstack-mcp
 | `>=` | 大于等于 | `memorySize>=1073741824` |
 | `<` | 小于 | `createDate<2024-01-01` |
 | `<=` | 小于等于 | |
-| `?=` | 模糊匹配(LIKE) | `name?=%test%` |
+| `?=` | 模糊匹配(LIKE，部分版本为 `like`) | `name?=%test%` |
 | `!?=` | 模糊不匹配 | |
 | `~=` | 正则匹配 | `name~=.*test.*` |
 | `!~=` | 正则不匹配 | |
