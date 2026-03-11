@@ -84,6 +84,7 @@ cover/
 .env
 .env.local
 .env.*
+config/zstack.env
 
 # ==========================
 # 常用框架特定文件

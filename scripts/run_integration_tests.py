@@ -7,7 +7,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
@@ -19,7 +19,7 @@ sys.path.insert(0, str(SRC_ROOT))
 
 from zstack_mcp.api_search import ApiSearchIndex  # noqa: E402
 from zstack_mcp.metric_search import MetricSearchIndex  # noqa: E402
-from zstack_mcp.zstack_client import ZStackClient, ZStackApiError  # noqa: E402
+from zstack_mcp.zstack_client import ZStackApiError, ZStackClient  # noqa: E402
 
 
 DEFAULT_PERIOD_SECONDS = 300
@@ -56,10 +56,6 @@ def zstack_time(dt: datetime) -> str:
 
 def iso_time(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def epoch_millis(dt: datetime) -> int:
-    return int(dt.timestamp() * 1000)
 
 
 def epoch_seconds(dt: datetime) -> int:
@@ -283,10 +279,7 @@ async def query_recent_long_jobs(
     result = await execute_api(client, api_index, ["Query", "Long", "Job"], "QueryLongJob", params)
     inventories = extract_inventories(result)
     failed_states = {"failed", "error", "canceled", "cancelled"}
-    filtered = [
-        item for item in inventories
-        if str(item.get("state", "")).lower() in failed_states
-    ]
+    filtered = [item for item in inventories if str(item.get("state", "")).lower() in failed_states]
     return filtered or inventories
 
 
@@ -328,55 +321,6 @@ async def query_hosts(
     return extract_inventories(result)
 
 
-async def fetch_metric_stats(
-    client: ZStackClient,
-    namespace: str,
-    metric_name: str,
-    label_key: str,
-    targets: list[MetricQueryTarget],
-    start_iso: str,
-    end_iso: str,
-    period: int,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    sem = asyncio.Semaphore(CONCURRENCY)
-    results: list[dict[str, Any]] = []
-    errors: list[dict[str, Any]] = []
-
-    async def fetch_one(target: MetricQueryTarget) -> None:
-        async with sem:
-            try:
-                result = await client.query_metric_data(
-                    namespace=namespace,
-                    metric_name=metric_name,
-                    start_time=start_iso,
-                    end_time=end_iso,
-                    period=period,
-                    labels=[f"{label_key}={target.uuid}"],
-                )
-                metric_error = extract_metric_error(result)
-                if metric_error:
-                    raise RuntimeError(metric_error)
-                values = collect_metric_values(result)
-                stats = summarize_values(values)
-                results.append({
-                    "uuid": target.uuid,
-                    "name": target.name,
-                    "stats": stats,
-                    "values_count": len(values),
-                    "extra": target.extra,
-                })
-            except Exception as exc:
-                errors.append({
-                    "uuid": target.uuid,
-                    "name": target.name,
-                    "error": str(exc),
-                    "extra": target.extra,
-                })
-
-    await asyncio.gather(*(fetch_one(target) for target in targets))
-    return results, errors
-
-
 async def fetch_metric_group_stats(
     client: ZStackClient,
     namespace: str,
@@ -403,7 +347,7 @@ async def fetch_metric_group_stats(
     if metric_error:
         return [], [{"metric": metric_name, "error": metric_error}]
 
-    data_points = []
+    data_points: list[Any] = []
     if isinstance(result, dict):
         data_points = result.get("data") or []
 
@@ -422,13 +366,15 @@ async def fetch_metric_group_stats(
     results = []
     for uuid, values in groups.items():
         stats = summarize_values(values)
-        results.append({
-            "uuid": uuid,
-            "name": name_map.get(uuid, uuid),
-            "stats": stats,
-            "values_count": len(values),
-            "extra": {"label": uuid},
-        })
+        results.append(
+            {
+                "uuid": uuid,
+                "name": name_map.get(uuid, uuid),
+                "stats": stats,
+                "values_count": len(values),
+                "extra": {"label": uuid},
+            }
+        )
 
     return results, []
 
@@ -454,12 +400,14 @@ def find_vm_disk_metrics(metric_index: MetricSearchIndex) -> list[dict[str, Any]
         name_lower = metric.name.lower()
         if "disk" in name_lower or "volume" in name_lower or "storage" in name_lower:
             if "used" in name_lower or "utilization" in name_lower or "percent" in name_lower or "capacity" in name_lower:
-                candidates.append({
-                    "name": metric.name,
-                    "namespace": metric.namespace,
-                    "labelNames": metric.label_names,
-                    "description": metric.description,
-                })
+                candidates.append(
+                    {
+                        "name": metric.name,
+                        "namespace": metric.namespace,
+                        "labelNames": metric.label_names,
+                        "description": metric.description,
+                    }
+                )
     return candidates
 
 
@@ -510,7 +458,7 @@ async def run() -> dict[str, Any]:
         report["recent_long_jobs"] = long_jobs
         report["alarm_records"] = alarm_records
 
-        analysis = defaultdict(int)
+        analysis: dict[str, int] = defaultdict(int)
         error_details = []
         for item in audit_errors:
             api_name = item.get("apiName", "")
@@ -524,15 +472,17 @@ async def run() -> dict[str, Any]:
                 error_text = str(error_info)
             key = f"{api_name}:{error_code or error_text[:80]}"
             analysis[key] += 1
-            error_details.append({
-                "apiName": api_name,
-                "errorCode": error_code,
-                "errorText": error_text,
-                "explanation": explain_error(error_text),
-                "startTime": item.get("startTime"),
-                "duration": item.get("duration"),
-                "requestUuid": item.get("requestUuid"),
-            })
+            error_details.append(
+                {
+                    "apiName": api_name,
+                    "errorCode": error_code,
+                    "errorText": error_text,
+                    "explanation": explain_error(error_text),
+                    "startTime": item.get("startTime"),
+                    "duration": item.get("duration"),
+                    "requestUuid": item.get("requestUuid"),
+                }
+            )
 
         report["audit_error_analysis"] = {
             "summary": [{"key": key, "count": count} for key, count in sorted(analysis.items(), key=lambda x: x[1], reverse=True)],
@@ -674,7 +624,13 @@ def main() -> None:
     try:
         report = asyncio.run(run())
     except ZStackApiError as exc:
-        print(json.dumps({"success": False, "error": str(exc), "code": exc.code, "details": exc.details}, ensure_ascii=False, indent=2))
+        print(
+            json.dumps(
+                {"success": False, "error": str(exc), "code": exc.code, "details": exc.details},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         return
     except Exception as exc:
         print(json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False, indent=2))
@@ -686,3 +642,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

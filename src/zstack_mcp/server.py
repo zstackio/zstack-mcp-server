@@ -13,6 +13,7 @@ ZStack MCP Server - 主入口
 - 设置环境变量 ZSTACK_ALLOW_ALL_API=true 可允许调用所有 API
 """
 
+import argparse
 import copy
 import json
 import os
@@ -30,7 +31,7 @@ from .zstack_client import ZStackClient, ZStackApiError
 
 
 # 初始化 MCP Server
-mcp = FastMCP("zstack-mcp-server")
+mcp = FastMCP("zstack_mcp_server")
 
 # 只读 API 前缀列表（安全的查询操作）
 READONLY_API_PREFIXES = (
@@ -1199,10 +1200,189 @@ async def get_metric_summary(
         }, ensure_ascii=False, indent=2)
 
 
+def _normalize_transport(value: Optional[str]) -> str:
+    if not value:
+        return "stdio"
+    return value.strip().lower()
+
+
+def _get_first_env(*keys: str) -> Optional[str]:
+    for key in keys:
+        value = os.environ.get(key)
+        if value:
+            return value
+    return None
+
+
+def _apply_fastmcp_network_settings(
+    host: Optional[str],
+    port: Optional[int],
+    streamable_path: Optional[str],
+) -> None:
+    if host:
+        mcp.settings.host = host
+        if (
+            mcp.settings.transport_security
+            and mcp.settings.transport_security.enable_dns_rebinding_protection
+            and host not in ("127.0.0.1", "localhost", "::1")
+        ):
+            allowed_hosts = set(mcp.settings.transport_security.allowed_hosts or [])
+            allowed_origins = set(mcp.settings.transport_security.allowed_origins or [])
+            allowed_hosts.add(f"{host}:*")
+            allowed_origins.add(f"http://{host}:*")
+            allowed_origins.add(f"https://{host}:*")
+            mcp.settings.transport_security.allowed_hosts = sorted(allowed_hosts)
+            mcp.settings.transport_security.allowed_origins = sorted(allowed_origins)
+    if port is not None:
+        mcp.settings.port = port
+    if streamable_path:
+        if not streamable_path.startswith("/"):
+            streamable_path = "/" + streamable_path
+        mcp.settings.streamable_http_path = streamable_path
+
+
+def _mask_sensitive_value(value: str, head: int = 2, tail: int = 2) -> str:
+    if not value:
+        return "(未设置)"
+    if len(value) <= head + tail:
+        return "*" * len(value)
+    return f"{value[:head]}{'*' * (len(value) - head - tail)}{value[-tail:]}"
+
+
+def _format_env_value(key: str, value: Optional[str]) -> str:
+    if not value:
+        return "(未设置)"
+    if key in {"ZSTACK_PASSWORD", "ZSTACK_SESSION_ID"}:
+        return _mask_sensitive_value(value, head=3, tail=3)
+    return value
+
+
+def _normalize_path_value(value: Optional[str], fallback: str) -> str:
+    if not value:
+        return fallback
+    return value if value.startswith("/") else f"/{value}"
+
+
+def _build_endpoint(host: str, port: int, path: str) -> str:
+    return f"http://{host}:{port}{path}"
+
+
+def _build_json_import_example(transport: str, endpoint: Optional[str]) -> dict[str, Any]:
+    if transport in {"sse", "streamable-http"} and endpoint:
+        return {
+            "mcpServers": {
+                "zstack": {
+                    "transport": transport,
+                    "url": endpoint,
+                }
+            }
+        }
+    return {
+        "mcpServers": {
+            "zstack": {
+                "command": "python",
+                "args": ["-m", "zstack_mcp.server"],
+                "env": {
+                    "ZSTACK_API_URL": "http://your-zstack-server:8080",
+                    "ZSTACK_ACCOUNT": "admin",
+                    "ZSTACK_PASSWORD": "your-password",
+                    "ZSTACK_ALLOW_ALL_API": "false",
+                },
+            }
+        }
+    }
+
+
+def _print_startup_summary(
+    transport: str,
+    sse_path: Optional[str],
+    streamable_path: Optional[str],
+) -> None:
+    host = getattr(mcp.settings, "host", None) or "127.0.0.1"
+    port = getattr(mcp.settings, "port", None) or 8000
+    sse_path = _normalize_path_value(sse_path or getattr(mcp.settings, "mount_path", None), "/sse")
+    streamable_path = _normalize_path_value(
+        streamable_path or getattr(mcp.settings, "streamable_http_path", None), "/mcp"
+    )
+
+    endpoint: Optional[str] = None
+    if transport == "sse":
+        endpoint = _build_endpoint(host, port, sse_path)
+    elif transport == "streamable-http":
+        endpoint = _build_endpoint(host, port, streamable_path)
+
+    print("\n=== ZStack MCP Server 启动信息 ===")
+    print(f"传输模式: {transport}")
+    if endpoint:
+        print(f"Endpoint: {endpoint}")
+    else:
+        print("Endpoint: (stdio 模式，无网络地址)")
+
+    env_keys = (
+        "ZSTACK_API_URL",
+        "ZSTACK_ACCOUNT",
+        "ZSTACK_PASSWORD",
+        "ZSTACK_SESSION_ID",
+        "ZSTACK_ALLOW_ALL_API",
+    )
+    print("\nZStack 环境变量:")
+    for key in env_keys:
+        value = _format_env_value(key, os.environ.get(key))
+        print(f"- {key}: {value}")
+
+    client = ZStackClient()
+    print("\nZStack API 端点（当前配置推导）:")
+    print(f"- api_url: {client.api_url}")
+    print(f"- api_endpoint: {client.api_endpoint}")
+    print(f"- auth_mode: {client.auth_mode}")
+
+    example = _build_json_import_example(transport, endpoint)
+    print("\nJSON 导入示例:")
+    print(json.dumps(example, ensure_ascii=False, indent=2))
+
+
 def main():
     """主入口函数"""
-    # 使用 stdio 传输运行 MCP Server
-    mcp.run(transport="stdio")
+    parser = argparse.ArgumentParser(description="ZStack MCP Server")
+    parser.add_argument(
+        "--transport",
+        choices=("stdio", "sse", "streamable-http"),
+        default=_normalize_transport(_get_first_env("MCP_TRANSPORT", "FASTMCP_TRANSPORT")),
+        help="MCP 传输模式（默认: stdio）",
+    )
+    parser.add_argument(
+        "--host",
+        default=_get_first_env("MCP_HOST", "FASTMCP_HOST"),
+        help="SSE 模式绑定地址（可选）",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(_get_first_env("MCP_PORT", "FASTMCP_PORT"))
+        if _get_first_env("MCP_PORT", "FASTMCP_PORT")
+        else None,
+        help="SSE 模式端口（可选）",
+    )
+    parser.add_argument(
+        "--path",
+        default=_get_first_env("MCP_PATH", "FASTMCP_MOUNT_PATH"),
+        help="SSE 模式挂载路径（可选）",
+    )
+    parser.add_argument(
+        "--streamable-path",
+        default=_get_first_env("MCP_STREAMABLE_PATH", "FASTMCP_STREAMABLE_HTTP_PATH"),
+        help="Streamable HTTP 模式路径（可选）",
+    )
+    args = parser.parse_args()
+
+    transport = _normalize_transport(args.transport)
+    streamable_path = args.streamable_path
+    if transport == "streamable-http" and not streamable_path:
+        streamable_path = args.path
+
+    _apply_fastmcp_network_settings(args.host, args.port, streamable_path)
+    _print_startup_summary(transport, args.path if transport == "sse" else None, streamable_path)
+    mcp.run(transport=transport, mount_path=args.path if transport == "sse" else None)
 
 
 if __name__ == "__main__":

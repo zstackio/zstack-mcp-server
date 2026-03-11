@@ -75,6 +75,40 @@ python -m zstack_mcp.server
 zstack-mcp
 ```
 
+### SSE 模式运行
+
+默认使用 stdio 传输。若需 SSE 模式，可用命令行或环境变量切换：
+
+```bash
+# 命令行方式
+zstack-mcp --transport sse --host 0.0.0.0 --port 8000
+
+# 环境变量方式
+export MCP_TRANSPORT="sse"
+export MCP_HOST="0.0.0.0"
+export MCP_PORT="8000"
+export MCP_PATH="/sse"  # 可选
+zstack-mcp
+```
+
+> 说明：也兼容 `FASTMCP_HOST` / `FASTMCP_PORT` / `FASTMCP_MOUNT_PATH`（FastMCP 原生环境变量）
+
+### Streamable HTTP 模式运行
+
+```bash
+# 命令行方式
+zstack-mcp --transport streamable-http --host 0.0.0.0 --port 8000 --streamable-path /mcp
+
+# 环境变量方式
+export MCP_TRANSPORT="streamable-http"
+export MCP_HOST="0.0.0.0"
+export MCP_PORT="8000"
+export MCP_STREAMABLE_PATH="/mcp"  # 可选
+zstack-mcp
+```
+
+> 说明：也兼容 `FASTMCP_STREAMABLE_HTTP_PATH`
+
 ### 在 Claude Desktop 中配置
 
 在 `claude_desktop_config.json` 中添加：
