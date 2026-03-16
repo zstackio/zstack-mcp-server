@@ -14,12 +14,14 @@ ZStack MCP Server - 主入口
 """
 
 import argparse
+import asyncio
+import atexit
 import copy
 import json
 import os
 import re
 import sys
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -62,7 +64,87 @@ def is_write_api_allowed() -> bool:
 # 全局索引和客户端
 _api_index: Optional[ApiSearchIndex] = None
 _metric_index: Optional[MetricSearchIndex] = None
-_zstack_client: Optional[ZStackClient] = None
+
+
+class _SessionManager:
+    """管理 ZStack session 生命周期，按账户缓存，避免重复创建"""
+
+    def __init__(self, max_sessions: int = 5):
+        self._clients: OrderedDict[str, ZStackClient] = OrderedDict()
+        self._max_sessions = max_sessions
+
+    async def get_client(
+        self,
+        account: Optional[str] = None,
+        password: Optional[str] = None,
+    ) -> ZStackClient:
+        """获取 client，优先用缓存的 session
+
+        凭据优先级：参数 > 环境变量。
+        如果既没有参数也没有环境变量且没有 ZSTACK_SESSION_ID，则抛出异常。
+        """
+        # 确定凭据来源
+        env_session_id = os.environ.get("ZSTACK_SESSION_ID", "")
+        env_account = os.environ.get("ZSTACK_ACCOUNT", "")
+        env_password = os.environ.get("ZSTACK_PASSWORD", "")
+
+        effective_account = account or env_account
+        effective_password = password or env_password
+
+        # 如果有 ZSTACK_SESSION_ID 且没有传参数 → 直接用 session_id
+        if not account and not password and env_session_id:
+            cache_key = f"__session_id__{env_session_id}"
+            if cache_key in self._clients:
+                self._clients.move_to_end(cache_key)
+                return self._clients[cache_key]
+            client = ZStackClient(session_id=env_session_id)
+            self._clients[cache_key] = client
+            return client
+
+        # 必须有凭据
+        if not effective_account or not effective_password:
+            raise ZStackApiError(
+                "缺少认证凭据。请通过 Tool 参数传入 account/password，"
+                "或设置环境变量 ZSTACK_ACCOUNT + ZSTACK_PASSWORD，"
+                "或设置 ZSTACK_SESSION_ID 直接使用已有会话"
+            )
+
+        cache_key = effective_account
+        if cache_key in self._clients:
+            self._clients.move_to_end(cache_key)
+            return self._clients[cache_key]
+
+        # 缓存未命中 → 创建新 client 并登录
+        client = ZStackClient(
+            account=effective_account,
+            password=effective_password,
+        )
+        await client.login()
+
+        # 超过上限 → 淘汰最早的
+        while len(self._clients) >= self._max_sessions:
+            _, old_client = self._clients.popitem(last=False)
+            await self._do_logout(old_client)
+
+        self._clients[cache_key] = client
+        return client
+
+    async def logout_all(self) -> None:
+        """服务关闭时清理所有 session"""
+        for key in list(self._clients):
+            client = self._clients.pop(key)
+            await self._do_logout(client)
+
+    @staticmethod
+    async def _do_logout(client: ZStackClient) -> None:
+        """调用 ZStack LogOut API 销毁 session"""
+        try:
+            await client.logout()
+        except Exception:
+            pass  # best-effort
+
+
+_session_mgr = _SessionManager()
 
 
 def get_data_dir() -> Path:
@@ -111,14 +193,6 @@ def get_metric_index() -> MetricSearchIndex:
         else:
             raise FileNotFoundError(f"找不到监控指标文件: {metric_path}")
     return _metric_index
-
-
-def get_zstack_client() -> ZStackClient:
-    """获取 ZStack 客户端（懒加载）"""
-    global _zstack_client
-    if _zstack_client is None:
-        _zstack_client = ZStackClient()
-    return _zstack_client
 
 
 def _extract_inventories(result: Any) -> list[dict[str, Any]]:
@@ -663,22 +737,29 @@ async def describe_api(api_name: str) -> str:
 
 
 @mcp.tool()
-async def execute_api(api_name: str, parameters: dict) -> str:
+async def execute_api(
+    api_name: str,
+    parameters: dict,
+    account: Optional[str] = None,
+    password: Optional[str] = None,
+) -> str:
     """
     执行 ZStack API
-    
+
     注意: 默认只允许调用只读 API（Query/Get/List 等）。
     如需调用写操作 API，请设置环境变量 ZSTACK_ALLOW_ALL_API=true
-    
+
     Args:
         api_name: API 名称，如 "QueryVmInstance"
         parameters: API 参数字典
                    对于 Query API，conditions 格式为:
                    [{"name": "字段名", "op": "操作符", "value": "值"}, ...]
-                   
+        account: 可选，ZStack 账户名（优先级高于环境变量）
+        password: 可选，ZStack 密码（优先级高于环境变量）
+
     Returns:
         API 执行结果 (JSON 格式)
-        
+
     Example:
         execute_api(
             api_name="QueryVmInstance",
@@ -725,7 +806,7 @@ async def execute_api(api_name: str, parameters: dict) -> str:
             parameters, normalization_warnings, normalized_changed = _normalize_query_parameters(parameters)
         
         # 获取客户端并执行
-        client = get_zstack_client()
+        client = await _session_mgr.get_client(account=account, password=password)
         is_async = api_info.call_type == 'async'
         
         result = await client.execute(
@@ -907,10 +988,12 @@ async def get_metric_data(
     period: Optional[int] = 60,
     labels: Optional[Any] = None,
     summary_only: bool = False,
+    account: Optional[str] = None,
+    password: Optional[str] = None,
 ) -> str:
     """
     获取 ZStack 监控数据
-    
+
     Args:
         namespace: 命名空间，如 "ZStack/VM", "ZStack/Host"
         metric_name: 指标名称，如 "CPUUsedUtilization"
@@ -919,6 +1002,8 @@ async def get_metric_data(
         period: 采样周期(秒)，默认 60
         labels: 标签过滤，如 ["VMUuid=xxx"] 或 {"VMUuid":"xxx"}
         summary_only: 仅返回统计信息（点数/最大/最小/平均/方差/标准差）
+        account: 可选，ZStack 账户名（优先级高于环境变量）
+        password: 可选，ZStack 密码（优先级高于环境变量）
 
     注意:
         返回数据量与时间跨度和 period 成正比。可用估算公式:
@@ -926,12 +1011,12 @@ async def get_metric_data(
         series_count 为不同 label 组合数量；若不传 labels，可能返回多组系列
         （例如指标包含 CPUNum/VMUuid 等 label 时每个组合都会产出一组序列）。
         为避免输出过大：缩短时间范围、增大 period 或增加 labels 过滤。
-        
+
     Returns:
         监控数据点列表
     """
     try:
-        client = get_zstack_client()
+        client = await _session_mgr.get_client(account=account, password=password)
         result = await client.query_metric_data(
             namespace=namespace,
             metric_name=metric_name,
@@ -1005,10 +1090,12 @@ async def get_metric_summary(
     threshold_value: Optional[float] = None,
     top_n: int = 10,
     resolve_resource: Optional[str] = None,
+    account: Optional[str] = None,
+    password: Optional[str] = None,
 ) -> str:
     """
     获取监控指标的聚合 TopN（按 label_key 分组）
-    
+
     Args:
         namespace: 命名空间，如 "ZStack/VM", "ZStack/Host"
         metric_name: 指标名称，如 "CPUOccupiedByVm"
@@ -1023,12 +1110,14 @@ async def get_metric_summary(
         threshold_value: 阈值数值
         top_n: 返回条数，默认 10
         resolve_resource: 可选 "vm" 或 "host"，用于解析名称
-        
+        account: 可选，ZStack 账户名（优先级高于环境变量）
+        password: 可选，ZStack 密码（优先级高于环境变量）
+
     Returns:
         聚合后的 TopN 列表
     """
     try:
-        client = get_zstack_client()
+        client = await _session_mgr.get_client(account=account, password=password)
         metrics = []
         if metric_names:
             metrics.extend([name for name in metric_names if name])
@@ -1382,6 +1471,19 @@ def main():
 
     _apply_fastmcp_network_settings(args.host, args.port, streamable_path)
     _print_startup_summary(transport, args.path if transport == "sse" else None, streamable_path)
+
+    def _shutdown_cleanup():
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(_session_mgr.logout_all())
+            else:
+                loop.run_until_complete(_session_mgr.logout_all())
+        except RuntimeError:
+            asyncio.run(_session_mgr.logout_all())
+
+    atexit.register(_shutdown_cleanup)
+
     mcp.run(transport=transport, mount_path=args.path if transport == "sse" else None)
 
 

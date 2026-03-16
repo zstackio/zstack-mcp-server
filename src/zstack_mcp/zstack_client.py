@@ -103,6 +103,20 @@ class ZStackClient:
             self._http_client = httpx.AsyncClient(timeout=60.0)
         return self._http_client
     
+    async def logout(self) -> None:
+        """调用 LogOut API 销毁当前 session，然后关闭 HTTP 客户端"""
+        if self.session and self.session.uuid:
+            try:
+                await self.execute(
+                    "LogOut",
+                    "org.zstack.header.identity.APILogOutMsg",
+                    {"sessionUuid": self.session.uuid},
+                )
+            except Exception:
+                pass  # best-effort，忽略 logout 失败
+            self.session = None
+        await self.close()
+
     async def close(self) -> None:
         """关闭客户端"""
         if self._http_client:

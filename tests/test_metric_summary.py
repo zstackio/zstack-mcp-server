@@ -1,4 +1,5 @@
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -16,6 +17,12 @@ class DummyClient:
         return {}
 
 
+def _patch_session_mgr(monkeypatch, dummy: DummyClient):
+    """让 _session_mgr.get_client 返回 dummy client"""
+    mock_get = AsyncMock(return_value=dummy)
+    monkeypatch.setattr(server._session_mgr, "get_client", mock_get)
+
+
 @pytest.mark.anyio
 async def test_get_metric_summary_threshold(monkeypatch) -> None:
     responses = {
@@ -28,7 +35,7 @@ async def test_get_metric_summary_threshold(monkeypatch) -> None:
         }
     }
     dummy = DummyClient(responses)
-    monkeypatch.setattr(server, "get_zstack_client", lambda: dummy)
+    _patch_session_mgr(monkeypatch, dummy)
 
     result = await server.get_metric_summary(
         namespace="ZStack/VM",
@@ -66,7 +73,7 @@ async def test_get_metric_summary_combine(monkeypatch) -> None:
         },
     }
     dummy = DummyClient(responses)
-    monkeypatch.setattr(server, "get_zstack_client", lambda: dummy)
+    _patch_session_mgr(monkeypatch, dummy)
 
     result = await server.get_metric_summary(
         namespace="ZStack/VM",
