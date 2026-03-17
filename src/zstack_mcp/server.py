@@ -148,23 +148,8 @@ _session_mgr = _SessionManager()
 
 
 def get_data_dir() -> Path:
-    """获取数据目录路径"""
-    # 首先尝试相对于当前文件的路径
-    current_dir = Path(__file__).parent
-    
-    # 尝试多个可能的路径
-    possible_paths = [
-        current_dir.parent.parent / "data",  # src/zstack_mcp/../../data
-        current_dir.parent.parent.parent / "data",  # 更上一级
-        Path.cwd() / "data",  # 当前工作目录下的 data
-    ]
-    
-    for path in possible_paths:
-        if path.exists():
-            return path
-    
-    # 默认返回第一个路径
-    return possible_paths[0]
+    """获取数据目录路径（包内 data 目录）"""
+    return Path(__file__).parent / "data"
 
 
 def get_api_index() -> ApiSearchIndex:

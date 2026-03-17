@@ -11,7 +11,7 @@ from typing import Any, Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
-DATA_DIR = REPO_ROOT / "data"
+DATA_DIR = SRC_ROOT / "zstack_mcp" / "data"
 API_DOCS_PATH = DATA_DIR / "api_docs.json"
 METRIC_PATH = DATA_DIR / "zs_all_metric_metadata.json"
 
