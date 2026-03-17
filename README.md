@@ -72,7 +72,7 @@ export ZSTACK_ALLOW_ALL_API="true"
 python -m zstack_mcp.server
 
 # 或使用入口点
-zstack-mcp
+zstack-mcp-server
 ```
 
 ### SSE 模式运行
@@ -81,14 +81,14 @@ zstack-mcp
 
 ```bash
 # 命令行方式
-zstack-mcp --transport sse --host 0.0.0.0 --port 8000
+zstack-mcp-server --transport sse --host 0.0.0.0 --port 8000
 
 # 环境变量方式
 export MCP_TRANSPORT="sse"
 export MCP_HOST="0.0.0.0"
 export MCP_PORT="8000"
 export MCP_PATH="/sse"  # 可选
-zstack-mcp
+zstack-mcp-server
 ```
 
 > 说明：也兼容 `FASTMCP_HOST` / `FASTMCP_PORT` / `FASTMCP_MOUNT_PATH`（FastMCP 原生环境变量）
@@ -97,14 +97,14 @@ zstack-mcp
 
 ```bash
 # 命令行方式
-zstack-mcp --transport streamable-http --host 0.0.0.0 --port 8000 --streamable-path /mcp
+zstack-mcp-server --transport streamable-http --host 0.0.0.0 --port 8000 --streamable-path /mcp
 
 # 环境变量方式
 export MCP_TRANSPORT="streamable-http"
 export MCP_HOST="0.0.0.0"
 export MCP_PORT="8000"
 export MCP_STREAMABLE_PATH="/mcp"  # 可选
-zstack-mcp
+zstack-mcp-server
 ```
 
 > 说明：也兼容 `FASTMCP_STREAMABLE_HTTP_PATH`

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zstack-mcp-server"
-version = "0.1.0"
+version = "0.1.1"
 description = "MCP Server for ZStack Cloud API - enables AI to dynamically query and execute 2000+ ZStack APIs"
 readme = "README.md"
 license = "MIT"
@@ -27,7 +27,7 @@ dependencies = [
 ]
 
 [project.scripts]
-zstack-mcp = "zstack_mcp.server:main"
+zstack-mcp-server = "zstack_mcp.server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/zstack_mcp"]
