@@ -434,6 +434,8 @@ class ZStackClient:
                 if state not in ('Done', 'Error'):
                     # 需要轮询
                     location = result.get('location')
+                    if not location and result.get('uuid'):
+                        location = f"{self.api_endpoint}result/{result['uuid']}"
                     if location:
                         return await self._poll_job(location)
             
