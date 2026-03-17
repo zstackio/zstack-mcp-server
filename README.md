@@ -13,12 +13,14 @@
 ## 安装
 
 ```bash
-# 使用 pip 安装
-pip install -e .
+# 从 PyPI 安装
+pip install zstack-mcp-server
 
 # 或者使用 uv
-uv pip install -e .
+uv pip install zstack-mcp-server
 ```
+
+> 💡 也可以不安装，直接用 `uvx` 或 `pipx run` 一键运行（见下方使用方式）
 
 ## 配置
 
@@ -68,10 +70,13 @@ export ZSTACK_ALLOW_ALL_API="true"
 ### 作为 MCP Server 运行
 
 ```bash
-# 直接运行
-python -m zstack_mcp.server
+# 使用 uvx 直接运行（无需安装）
+uvx zstack-mcp-server
 
-# 或使用入口点
+# 或使用 pipx
+pipx run zstack-mcp-server
+
+# 如果已安装，直接运行
 zstack-mcp-server
 ```
 
@@ -81,14 +86,14 @@ zstack-mcp-server
 
 ```bash
 # 命令行方式
-zstack-mcp-server --transport sse --host 0.0.0.0 --port 8000
+uvx zstack-mcp-server --transport sse --host 0.0.0.0 --port 8000
 
 # 环境变量方式
 export MCP_TRANSPORT="sse"
 export MCP_HOST="0.0.0.0"
 export MCP_PORT="8000"
 export MCP_PATH="/sse"  # 可选
-zstack-mcp-server
+uvx zstack-mcp-server
 ```
 
 > 说明：也兼容 `FASTMCP_HOST` / `FASTMCP_PORT` / `FASTMCP_MOUNT_PATH`（FastMCP 原生环境变量）
@@ -97,14 +102,14 @@ zstack-mcp-server
 
 ```bash
 # 命令行方式
-zstack-mcp-server --transport streamable-http --host 0.0.0.0 --port 8000 --streamable-path /mcp
+uvx zstack-mcp-server --transport streamable-http --host 0.0.0.0 --port 8000 --streamable-path /mcp
 
 # 环境变量方式
 export MCP_TRANSPORT="streamable-http"
 export MCP_HOST="0.0.0.0"
 export MCP_PORT="8000"
 export MCP_STREAMABLE_PATH="/mcp"  # 可选
-zstack-mcp-server
+uvx zstack-mcp-server
 ```
 
 > 说明：也兼容 `FASTMCP_STREAMABLE_HTTP_PATH`
@@ -118,8 +123,8 @@ zstack-mcp-server
 {
   "mcpServers": {
     "zstack": {
-      "command": "python",
-      "args": ["-m", "zstack_mcp.server"],
+      "command": "uvx",
+      "args": ["zstack-mcp-server"],
       "env": {
         "ZSTACK_API_URL": "http://your-zstack-server:8080",
         "ZSTACK_ACCOUNT": "admin",
@@ -136,8 +141,8 @@ zstack-mcp-server
 {
   "mcpServers": {
     "zstack": {
-      "command": "python",
-      "args": ["-m", "zstack_mcp.server"],
+      "command": "uvx",
+      "args": ["zstack-mcp-server"],
       "env": {
         "ZSTACK_API_URL": "http://your-zstack-server:8080",
         "ZSTACK_SESSION_ID": "your-session-uuid",
@@ -271,6 +276,10 @@ AI 会:
 ## 开发
 
 ```bash
+# 克隆仓库
+git clone https://github.com/zstackio/zstack-mcp-server.git
+cd zstack-mcp-server
+
 # 安装开发依赖
 pip install -e ".[dev]"
 
