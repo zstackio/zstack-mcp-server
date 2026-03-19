@@ -242,7 +242,8 @@ class ApiSearchIndex:
             result['usage'] = (
                 "Query: conditions=[{name,op,value}], fields is array. "
                 "Ops: =,!=,>,<,>=,<=,?=(like,use %),like(compat),~=(regex,optional),in,is null. "
-                "Sort: sortBy, sortDirection."
+                "Sort: sortBy, sortDirection. "
+                "Pagination: limit (default 50), start (offset). Use fields to reduce response size."
             )
         
         return result

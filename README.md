@@ -36,6 +36,10 @@ export ZSTACK_PASSWORD="your-password"          # 密码（明文）
 
 # 认证方式二：直接传入 SessionID（优先级更高，设置后忽略用户名密码）
 export ZSTACK_SESSION_ID="your-session-uuid"    # 已有的 Session UUID
+
+# 查询响应控制（可选）
+export ZSTACK_QUERY_DEFAULT_LIMIT="50"          # Query API 默认 limit（设 0 禁用）
+export ZSTACK_RESPONSE_SIZE_LIMIT="65536"       # 响应大小上限，字节（设 0 禁用）
 ```
 
 ### 认证方式说明
@@ -64,6 +68,18 @@ export ZSTACK_ALLOW_ALL_API="true"
 ```
 
 ⚠️ **警告**: 启用写操作后，AI 可以执行创建、删除、修改等危险操作，请谨慎使用！
+
+### 查询响应控制
+
+Query API 默认注入 `limit=50`，防止一次拉取全量数据撑满模型上下文窗口。响应超过 64KB 时会自动裁剪 inventories 列表，保证返回合法 JSON。
+
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
+| `ZSTACK_QUERY_DEFAULT_LIMIT` | `50` | Query API 未指定 limit 时自动注入的默认值，设 `0` 禁用 |
+| `ZSTACK_RESPONSE_SIZE_LIMIT` | `65536` | 响应大小上限（字节），超过后裁剪，设 `0` 禁用 |
+
+- 显式传入 `limit` 时不会被覆盖
+- 裁剪发生时响应中会包含 `_truncation` 字段，提示使用 `limit`/`start` 翻页或 `fields` 精简返回字段
 
 ## 使用方式
 

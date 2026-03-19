@@ -195,6 +195,121 @@ def _extract_inventories(result: Any) -> list[dict[str, Any]]:
     return []
 
 
+def _get_query_default_limit() -> int:
+    """获取 Query API 默认 limit，环境变量 ZSTACK_QUERY_DEFAULT_LIMIT，默认 50，设 0 禁用"""
+    raw = os.environ.get("ZSTACK_QUERY_DEFAULT_LIMIT", "50")
+    try:
+        return max(int(raw), 0)
+    except (ValueError, TypeError):
+        return 50
+
+
+def _get_response_size_limit() -> int:
+    """获取响应大小上限（字节），环境变量 ZSTACK_RESPONSE_SIZE_LIMIT，默认 65536，设 0 禁用"""
+    raw = os.environ.get("ZSTACK_RESPONSE_SIZE_LIMIT", "65536")
+    try:
+        return max(int(raw), 0)
+    except (ValueError, TypeError):
+        return 65536
+
+
+def _apply_query_defaults(parameters: dict) -> Optional[dict]:
+    """为 Query API 注入默认 limit（如果用户未显式指定）。
+
+    返回一个提示 dict（_defaultLimit）或 None。
+    会直接修改 parameters。
+    """
+    default_limit = _get_query_default_limit()
+    if default_limit <= 0:
+        return None
+
+    # 用户已显式指定 limit，不覆盖
+    if "limit" in parameters:
+        return None
+
+    parameters["limit"] = default_limit
+    # 同时注入 replyWithCount 以便返回 totalCount
+    if "replyWithCount" not in parameters:
+        parameters["replyWithCount"] = True
+
+    return {
+        "applied": default_limit,
+        "hint": f"Default limit={default_limit} applied. Use 'limit' and 'start' to paginate, or 'fields' to reduce response size.",
+    }
+
+
+def _truncate_response_if_needed(
+    response_payload: dict[str, Any],
+    result: Any,
+    size_limit: int,
+) -> None:
+    """如果序列化后的响应超过 size_limit，渐进裁剪 inventories 列表。
+
+    直接修改 response_payload 和 result（如果是 dict）。
+    """
+    if size_limit <= 0:
+        return
+
+    serialized = json.dumps(response_payload, ensure_ascii=False)
+    if len(serialized.encode("utf-8")) <= size_limit:
+        return
+
+    # 找到 inventories 列表的 key
+    if not isinstance(result, dict):
+        return
+
+    inv_key: Optional[str] = None
+    inventories: Optional[list] = None
+    for key in ("inventories", "inventory", "records", "results", "longJobs", "jobs"):
+        value = result.get(key)
+        if isinstance(value, list) and len(value) > 1:
+            inv_key = key
+            inventories = value
+            break
+
+    if inv_key is None or inventories is None:
+        return
+
+    original_count = len(inventories)
+
+    # 预估 _truncation 元数据的大小，在二分查找时预留空间
+    truncation_template = {
+        "reason": "response_size_limit",
+        "originalCount": original_count,
+        "returnedCount": original_count,
+        "sizeLimit": size_limit,
+        "hint": f"Response exceeded {size_limit} bytes. Showing {original_count}/{original_count} items. Use 'limit', 'start' to paginate, or 'fields' to select specific columns.",
+    }
+    truncation_overhead = len(json.dumps({"_truncation": truncation_template}, ensure_ascii=False).encode("utf-8")) + 2  # +2 for comma and spacing
+
+    effective_limit = size_limit - truncation_overhead
+
+    # 二分查找：找到最大的 count 使得序列化大小 <= effective_limit
+    lo, hi = 0, original_count
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        result[inv_key] = inventories[:mid]
+        response_payload["result"] = result
+        response_payload["resultCount"] = mid
+        trial = json.dumps(response_payload, ensure_ascii=False)
+        if len(trial.encode("utf-8")) <= effective_limit:
+            lo = mid
+        else:
+            hi = mid - 1
+
+    kept = lo
+    result[inv_key] = inventories[:kept]
+    response_payload["result"] = result
+    response_payload["resultCount"] = kept
+    response_payload["_truncation"] = {
+        "reason": "response_size_limit",
+        "originalCount": original_count,
+        "returnedCount": kept,
+        "sizeLimit": size_limit,
+        "hint": f"Response exceeded {size_limit} bytes. Showing {kept}/{original_count} items. Use 'limit', 'start' to paginate, or 'fields' to select specific columns.",
+    }
+
+
 def _normalize_keywords(keywords: Any) -> tuple[list[str], bool]:
     if keywords is None:
         return [], False
@@ -739,6 +854,8 @@ async def execute_api(
         parameters: API 参数字典
                    对于 Query API，conditions 格式为:
                    [{"name": "字段名", "op": "操作符", "value": "值"}, ...]
+                   分页: limit（默认 50）、start（偏移量）
+                   字段选择: fields（减少返回数据量）
         account: 可选，ZStack 账户名（优先级高于环境变量）
         password: 可选，ZStack 密码（优先级高于环境变量）
 
@@ -787,20 +904,22 @@ async def execute_api(
 
         normalization_warnings: list[str] = []
         normalized_changed = False
+        default_limit_hint: Optional[dict] = None
         if api_name.startswith("Query"):
             parameters, normalization_warnings, normalized_changed = _normalize_query_parameters(parameters)
-        
+            default_limit_hint = _apply_query_defaults(parameters)
+
         # 获取客户端并执行
         client = await _session_mgr.get_client(account=account, password=password)
         is_async = api_info.call_type == 'async'
-        
+
         result = await client.execute(
             api_name=api_name,
             full_api_name=api_info.full_name,
             parameters=parameters,
             is_async=is_async,
         )
-        
+
         response_payload: dict[str, Any] = {
             "success": True,
             "result": result,
@@ -808,10 +927,19 @@ async def execute_api(
         if api_name.startswith("Query"):
             inventories = _extract_inventories(result)
             response_payload["resultCount"] = len(inventories)
+            if isinstance(result, dict) and "total" in result:
+                response_payload["totalCount"] = result["total"]
         if normalization_warnings:
             response_payload["warnings"] = normalization_warnings
         if normalized_changed:
             response_payload["normalizedParameters"] = parameters
+        if default_limit_hint:
+            response_payload["_defaultLimit"] = default_limit_hint
+
+        # 响应大小兜底裁剪
+        if api_name.startswith("Query"):
+            _truncate_response_if_needed(response_payload, result, _get_response_size_limit())
+
         return json.dumps(response_payload, ensure_ascii=False, indent=2)
         
     except ZStackApiError as e:
@@ -1398,6 +1526,8 @@ def _print_startup_summary(
         "ZSTACK_PASSWORD",
         "ZSTACK_SESSION_ID",
         "ZSTACK_ALLOW_ALL_API",
+        "ZSTACK_QUERY_DEFAULT_LIMIT",
+        "ZSTACK_RESPONSE_SIZE_LIMIT",
     )
     print("\nZStack 环境变量:")
     for key in env_keys:

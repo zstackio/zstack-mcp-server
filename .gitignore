@@ -85,6 +85,8 @@ cover/
 .env.local
 .env.*
 config/zstack.env
+opencode.json
+articles/
 
 # ==========================
 # 常用框架特定文件
