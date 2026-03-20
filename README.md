@@ -130,6 +130,49 @@ uvx zstack-mcp-server
 
 > 说明：也兼容 `FASTMCP_STREAMABLE_HTTP_PATH`
 
+### HTTP 头认证（多租户模式）
+
+在 SSE 或 streamable-http 模式下，管理员可以启动一个共享的 MCP Server，多个用户通过 HTTP 头传入各自的凭据，实现多租户隔离。
+
+支持的 HTTP 头：
+
+| HTTP Header | 对应环境变量 | 说明 |
+|---|---|---|
+| `X-ZStack-Account` | `ZSTACK_ACCOUNT` | 账户名 |
+| `X-ZStack-Password` | `ZSTACK_PASSWORD` | 密码 |
+| `X-ZStack-Session-Id` | `ZSTACK_SESSION_ID` | 已有 Session（优先级高于账号密码） |
+| `X-ZStack-API-URL` | `ZSTACK_API_URL` | ZStack 管理节点地址（可代理多套环境） |
+
+凭据优先级：HTTP 头 > 环境变量
+
+典型用法：
+```bash
+# 管理员启动共享 MCP Server
+ZSTACK_ALLOW_ALL_API=false uvx zstack-mcp-server --transport streamable-http --host 0.0.0.0 --port 8000
+```
+
+用户在 MCP 客户端配置中添加 HTTP 头即可使用各自的账号：
+```json
+{
+  "mcpServers": {
+    "zstack": {
+      "transport": "streamable-http",
+      "url": "http://mcp-server:8000/mcp",
+      "headers": {
+        "X-ZStack-Account": "user-a",
+        "X-ZStack-Password": "password-a",
+        "X-ZStack-API-URL": "http://zstack-env-1:8080"
+      }
+    }
+  }
+}
+```
+
+特性：
+- 同一账号的 Session 会自动缓存复用，不会每次请求都创建新 Session
+- 不同 `X-ZStack-API-URL` 的请求会路由到不同的 ZStack 环境
+- stdio 模式下无 HTTP 头，自动回退到环境变量认证，行为不变
+
 ### 在 Claude Desktop 中配置
 
 在 `claude_desktop_config.json` 中添加：

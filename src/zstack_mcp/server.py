@@ -18,14 +18,16 @@ import asyncio
 import atexit
 import copy
 import json
+import logging
 import os
 import re
 import sys
 from collections import OrderedDict, defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 from .api_search import ApiSearchIndex
 from .metric_search import MetricSearchIndex
@@ -65,6 +67,37 @@ def is_write_api_allowed() -> bool:
 _api_index: Optional[ApiSearchIndex] = None
 _metric_index: Optional[MetricSearchIndex] = None
 
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class RequestAuth:
+    """从 HTTP 请求头中提取的认证信息"""
+    account: Optional[str] = None
+    password: Optional[str] = None
+    session_id: Optional[str] = None
+    api_url: Optional[str] = None
+
+
+def _extract_auth_from_context(ctx: Context) -> RequestAuth:
+    """从 FastMCP Context 中提取 HTTP 头认证信息。
+
+    在 streamable-http / SSE 模式下，ctx.request_context.request 是 Starlette Request，
+    可以读取 HTTP headers。stdio 模式下没有 HTTP request，安全返回全空。
+    """
+    auth = RequestAuth()
+    try:
+        request = ctx.request_context.request
+        headers = request.headers
+        auth.account = headers.get("x-zstack-account") or None
+        auth.password = headers.get("x-zstack-password") or None
+        auth.session_id = headers.get("x-zstack-session-id") or None
+        auth.api_url = headers.get("x-zstack-api-url") or None
+    except Exception:
+        # stdio 模式或其他无 HTTP request 的场景，安全忽略
+        pass
+    return auth
+
 
 class _SessionManager:
     """管理 ZStack session 生命周期，按账户缓存，避免重复创建"""
@@ -77,39 +110,44 @@ class _SessionManager:
         self,
         account: Optional[str] = None,
         password: Optional[str] = None,
+        session_id: Optional[str] = None,
+        api_url: Optional[str] = None,
     ) -> ZStackClient:
         """获取 client，优先用缓存的 session
 
-        凭据优先级：参数 > 环境变量。
-        如果既没有参数也没有环境变量且没有 ZSTACK_SESSION_ID，则抛出异常。
+        凭据优先级：参数（HTTP 头）> 环境变量。
+        如果既没有参数也没有环境变量且没有 session_id，则抛出异常。
         """
         # 确定凭据来源
         env_session_id = os.environ.get("ZSTACK_SESSION_ID", "")
         env_account = os.environ.get("ZSTACK_ACCOUNT", "")
         env_password = os.environ.get("ZSTACK_PASSWORD", "")
+        env_api_url = os.environ.get("ZSTACK_API_URL", "")
 
+        effective_session_id = session_id or env_session_id
         effective_account = account or env_account
         effective_password = password or env_password
+        effective_api_url = api_url or env_api_url or None
 
-        # 如果有 ZSTACK_SESSION_ID 且没有传参数 → 直接用 session_id
-        if not account and not password and env_session_id:
-            cache_key = f"__session_id__{env_session_id}"
+        # 如果有 session_id（参数传入或环境变量）且没有传账号密码 → 直接用 session_id
+        if effective_session_id and not account and not password:
+            cache_key = f"__session_id__{effective_api_url or ''}|{effective_session_id}"
             if cache_key in self._clients:
                 self._clients.move_to_end(cache_key)
                 return self._clients[cache_key]
-            client = ZStackClient(session_id=env_session_id)
+            client = ZStackClient(session_id=effective_session_id, api_url=effective_api_url)
             self._clients[cache_key] = client
             return client
 
         # 必须有凭据
         if not effective_account or not effective_password:
             raise ZStackApiError(
-                "缺少认证凭据。请通过 Tool 参数传入 account/password，"
+                "缺少认证凭据。请通过 HTTP 头传入 X-ZStack-Account/X-ZStack-Password，"
                 "或设置环境变量 ZSTACK_ACCOUNT + ZSTACK_PASSWORD，"
-                "或设置 ZSTACK_SESSION_ID 直接使用已有会话"
+                "或设置 ZSTACK_SESSION_ID / X-ZStack-Session-Id 直接使用已有会话"
             )
 
-        cache_key = effective_account
+        cache_key = f"{effective_api_url or ''}|{effective_account}"
         if cache_key in self._clients:
             self._clients.move_to_end(cache_key)
             return self._clients[cache_key]
@@ -118,6 +156,7 @@ class _SessionManager:
         client = ZStackClient(
             account=effective_account,
             password=effective_password,
+            api_url=effective_api_url,
         )
         await client.login()
 
@@ -840,8 +879,7 @@ async def describe_api(api_name: str) -> str:
 async def execute_api(
     api_name: str,
     parameters: dict,
-    account: Optional[str] = None,
-    password: Optional[str] = None,
+    ctx: Context = None,
 ) -> str:
     """
     执行 ZStack API
@@ -856,8 +894,6 @@ async def execute_api(
                    [{"name": "字段名", "op": "操作符", "value": "值"}, ...]
                    分页: limit（默认 50）、start（偏移量）
                    字段选择: fields（减少返回数据量）
-        account: 可选，ZStack 账户名（优先级高于环境变量）
-        password: 可选，ZStack 密码（优先级高于环境变量）
 
     Returns:
         API 执行结果 (JSON 格式)
@@ -910,7 +946,13 @@ async def execute_api(
             default_limit_hint = _apply_query_defaults(parameters)
 
         # 获取客户端并执行
-        client = await _session_mgr.get_client(account=account, password=password)
+        auth = _extract_auth_from_context(ctx) if ctx else RequestAuth()
+        client = await _session_mgr.get_client(
+            account=auth.account,
+            password=auth.password,
+            session_id=auth.session_id,
+            api_url=auth.api_url,
+        )
         is_async = api_info.call_type == 'async'
 
         result = await client.execute(
@@ -1101,8 +1143,7 @@ async def get_metric_data(
     period: Optional[int] = 60,
     labels: Optional[Any] = None,
     summary_only: bool = False,
-    account: Optional[str] = None,
-    password: Optional[str] = None,
+    ctx: Context = None,
 ) -> str:
     """
     获取 ZStack 监控数据
@@ -1115,8 +1156,6 @@ async def get_metric_data(
         period: 采样周期(秒)，默认 60
         labels: 标签过滤，如 ["VMUuid=xxx"] 或 {"VMUuid":"xxx"}
         summary_only: 仅返回统计信息（点数/最大/最小/平均/方差/标准差）
-        account: 可选，ZStack 账户名（优先级高于环境变量）
-        password: 可选，ZStack 密码（优先级高于环境变量）
 
     注意:
         返回数据量与时间跨度和 period 成正比。可用估算公式:
@@ -1129,7 +1168,13 @@ async def get_metric_data(
         监控数据点列表
     """
     try:
-        client = await _session_mgr.get_client(account=account, password=password)
+        auth = _extract_auth_from_context(ctx) if ctx else RequestAuth()
+        client = await _session_mgr.get_client(
+            account=auth.account,
+            password=auth.password,
+            session_id=auth.session_id,
+            api_url=auth.api_url,
+        )
         result = await client.query_metric_data(
             namespace=namespace,
             metric_name=metric_name,
@@ -1203,8 +1248,7 @@ async def get_metric_summary(
     threshold_value: Optional[float] = None,
     top_n: int = 10,
     resolve_resource: Optional[str] = None,
-    account: Optional[str] = None,
-    password: Optional[str] = None,
+    ctx: Context = None,
 ) -> str:
     """
     获取监控指标的聚合 TopN（按 label_key 分组）
@@ -1223,14 +1267,18 @@ async def get_metric_summary(
         threshold_value: 阈值数值
         top_n: 返回条数，默认 10
         resolve_resource: 可选 "vm" 或 "host"，用于解析名称
-        account: 可选，ZStack 账户名（优先级高于环境变量）
-        password: 可选，ZStack 密码（优先级高于环境变量）
 
     Returns:
         聚合后的 TopN 列表
     """
     try:
-        client = await _session_mgr.get_client(account=account, password=password)
+        auth = _extract_auth_from_context(ctx) if ctx else RequestAuth()
+        client = await _session_mgr.get_client(
+            account=auth.account,
+            password=auth.password,
+            session_id=auth.session_id,
+            api_url=auth.api_url,
+        )
         metrics = []
         if metric_names:
             metrics.extend([name for name in metric_names if name])
@@ -1536,6 +1584,13 @@ def _print_startup_summary(
     print(f"- api_url: {client.api_url}")
     print(f"- api_endpoint: {client.api_endpoint}")
     print(f"- auth_mode: {client.auth_mode}")
+
+    if transport in ("sse", "streamable-http"):
+        print("\n多租户 HTTP 头认证（优先级高于环境变量）:")
+        print("- X-ZStack-Account: 账户名")
+        print("- X-ZStack-Password: 密码")
+        print("- X-ZStack-Session-Id: 已有 Session UUID")
+        print("- X-ZStack-API-URL: ZStack 管理节点地址（可代理多套环境）")
 
     example = _build_json_import_example(transport, endpoint)
     print("\nJSON 导入示例:")
