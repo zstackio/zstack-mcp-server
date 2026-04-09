@@ -1423,18 +1423,15 @@ def _apply_fastmcp_network_settings(
 ) -> None:
     if host:
         mcp.settings.host = host
+        # When binding to a non-loopback address (e.g. 0.0.0.0 or a LAN IP),
+        # disable DNS rebinding protection so that MCP clients (Dify, Claude Desktop,
+        # etc.) connecting from any origin are not rejected with 403/421.
         if (
             mcp.settings.transport_security
             and mcp.settings.transport_security.enable_dns_rebinding_protection
             and host not in ("127.0.0.1", "localhost", "::1")
         ):
-            allowed_hosts = set(mcp.settings.transport_security.allowed_hosts or [])
-            allowed_origins = set(mcp.settings.transport_security.allowed_origins or [])
-            allowed_hosts.add(f"{host}:*")
-            allowed_origins.add(f"http://{host}:*")
-            allowed_origins.add(f"https://{host}:*")
-            mcp.settings.transport_security.allowed_hosts = sorted(allowed_hosts)
-            mcp.settings.transport_security.allowed_origins = sorted(allowed_origins)
+            mcp.settings.transport_security.enable_dns_rebinding_protection = False
     if port is not None:
         mcp.settings.port = port
     if streamable_path:
