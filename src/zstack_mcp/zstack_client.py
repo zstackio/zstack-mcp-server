@@ -52,7 +52,8 @@ class ZStackRestRoute:
 
 
 REST_API_ROUTES: dict[str, ZStackRestRoute] = {
-    # 常用只读 Query API，路径来自 zstack-sdk-go-v2 generated actions。
+    # 常用只读 REST API，路径来自 zstack-sdk-go-v2 generated actions。
+    "GetMetricData": ZStackRestRoute("GET", "v1/zwatch/metrics"),
     "QueryAccessKey": ZStackRestRoute("GET", "v1/accesskeys"),
     "QueryAccount": ZStackRestRoute("GET", "v1/accounts"),
     "QueryBackupStorage": ZStackRestRoute("GET", "v1/backup-storage"),
@@ -339,6 +340,68 @@ class ZStackClient:
 
         return query
 
+    @staticmethod
+    def _first_present(parameters: dict[str, Any], *keys: str) -> Any:
+        for key in keys:
+            if key in parameters and parameters[key] is not None:
+                return parameters[key]
+        return None
+
+    @classmethod
+    def _metric_rest_query_params(cls, parameters: dict[str, Any]) -> dict[str, Any]:
+        query: dict[str, Any] = {}
+
+        metric_name = cls._first_present(parameters, "metricName", "metric_name")
+        scalar_values = {
+            "namespace": cls._first_present(parameters, "namespace"),
+            "metricName": metric_name,
+            "startTime": cls._normalize_metric_time(
+                cls._first_present(parameters, "startTime", "start_time")
+            ),
+            "endTime": cls._normalize_metric_time(
+                cls._first_present(parameters, "endTime", "end_time")
+            ),
+            "offsetAheadOfCurrentTime": cls._first_present(
+                parameters,
+                "offsetAheadOfCurrentTime",
+                "offset_ahead_of_current_time",
+            ),
+            "period": cls._normalize_metric_period(
+                cls._first_present(parameters, "period")
+            ),
+        }
+        for key, value in scalar_values.items():
+            if value is not None:
+                query[key] = value
+
+        labels = cls._normalize_metric_labels(parameters.get("labels"))
+        if labels:
+            query["labels"] = labels
+
+        repeated_values = {
+            "valueConditions": cls._first_present(
+                parameters,
+                "valueConditions",
+                "value_conditions",
+            ),
+            "functions": cls._first_present(parameters, "functions"),
+        }
+        for key, value in repeated_values.items():
+            if value is not None:
+                query[key] = (
+                    list(value)
+                    if isinstance(value, (list, tuple, set))
+                    else value
+                )
+
+        return query
+
+    @classmethod
+    def _rest_params_for_api(cls, api_name: str, parameters: dict[str, Any]) -> dict[str, Any]:
+        if api_name == "GetMetricData":
+            return cls._metric_rest_query_params(parameters)
+        return cls._rest_query_params(parameters)
+
     def _rest_route_for_api(self, api_name: str) -> ZStackRestRoute:
         route = REST_API_ROUTES.get(api_name)
         if route is None:
@@ -371,7 +434,7 @@ class ZStackClient:
             )
 
         url = self._rest_url(route.path)
-        query = self._rest_query_params(parameters)
+        query = self._rest_params_for_api(api_name, parameters)
         if query:
             url = f"{url}?{urlencode(query, doseq=True)}"
 
@@ -394,7 +457,8 @@ class ZStackClient:
             )
 
         if isinstance(result, list):
-            return {"inventories": result}
+            list_key = "data" if api_name == "GetMetricData" else "inventories"
+            return {list_key: result}
         if isinstance(result, dict):
             if "error" in result:
                 error = result["error"]
@@ -830,16 +894,15 @@ class ZStackClient:
 
         async def send_once() -> dict[str, Any]:
             if self.auth_mode == "access_key":
-                raise ZStackApiError(
-                    message=(
-                        "AK/SK 认证不支持 /zstack/api/ message API，"
-                        "get_metric_data 暂未配置 REST 路由映射"
-                    ),
-                    code="REST_MAPPING_NOT_FOUND",
-                    details={
-                        "apiName": "GetMetricData",
-                        "authMode": "access_key",
-                        "hint": "请为 GetMetricData 增加 REST path/method/parameter 映射，或改用账号密码/session 认证。",
+                return await self.execute_rest(
+                    "GetMetricData",
+                    {
+                        "namespace": namespace,
+                        "metricName": metric_name,
+                        "startTime": start_time,
+                        "endTime": end_time,
+                        "period": period,
+                        "labels": labels,
                     },
                 )
             payload = {
