@@ -1,9 +1,10 @@
 """
 ZStack API 客户端 - 处理与 ZStack Cloud 的 API 通信
 
-支持两种认证方式:
+支持三种认证方式:
 1. 用户名密码登录获取 Session
 2. 直接传入 SessionID（通过环境变量 ZSTACK_SESSION_ID）
+3. AccessKey/SecretKey 请求签名（通过环境变量 ZSTACK_ACCESS_KEY_ID / ZSTACK_ACCESS_KEY_SECRET）
 
 支持:
 - 自动登录和 session 管理
@@ -12,12 +13,16 @@ ZStack API 客户端 - 处理与 ZStack Cloud 的 API 通信
 """
 
 import asyncio
+import base64
 import hashlib
+import hmac
 import json
 import os
 from datetime import datetime, timezone
+from email.utils import format_datetime
 from typing import Any, Optional
 from dataclasses import dataclass
+from urllib.parse import urlencode, urlparse
 
 import httpx
 
@@ -39,13 +44,66 @@ class ZStackSession:
     expire_date: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class ZStackRestRoute:
+    """ZStack REST 路由映射。path 不包含 /zstack 前缀。"""
+    method: str
+    path: str
+
+
+REST_API_ROUTES: dict[str, ZStackRestRoute] = {
+    # 常用只读 Query API，路径来自 zstack-sdk-go-v2 generated actions。
+    "QueryAccessKey": ZStackRestRoute("GET", "v1/accesskeys"),
+    "QueryAccount": ZStackRestRoute("GET", "v1/accounts"),
+    "QueryBackupStorage": ZStackRestRoute("GET", "v1/backup-storage"),
+    "QueryCephBackupStorage": ZStackRestRoute("GET", "v1/backup-storage/ceph"),
+    "QueryCephPrimaryStorage": ZStackRestRoute("GET", "v1/primary-storage/ceph"),
+    "QueryCluster": ZStackRestRoute("GET", "v1/clusters"),
+    "QueryDiskOffering": ZStackRestRoute("GET", "v1/disk-offerings"),
+    "QueryEip": ZStackRestRoute("GET", "v1/eips"),
+    "QueryGlobalConfig": ZStackRestRoute("GET", "v1/global-configurations"),
+    "QueryHost": ZStackRestRoute("GET", "v1/hosts"),
+    "QueryImage": ZStackRestRoute("GET", "v1/images"),
+    "QueryImageStoreBackupStorage": ZStackRestRoute("GET", "v1/backup-storage/image-store"),
+    "QueryInstanceOffering": ZStackRestRoute("GET", "v1/instance-offerings"),
+    "QueryIpRange": ZStackRestRoute("GET", "v1/l3-networks/ip-ranges"),
+    "QueryL2Network": ZStackRestRoute("GET", "v1/l2-networks"),
+    "QueryL3Network": ZStackRestRoute("GET", "v1/l3-networks"),
+    "QueryLoadBalancer": ZStackRestRoute("GET", "v1/load-balancers"),
+    "QueryLoadBalancerListener": ZStackRestRoute("GET", "v1/load-balancers/listeners"),
+    "QueryLocalStorageResourceRef": ZStackRestRoute("GET", "v1/primary-storage/local-storage/resource-refs"),
+    "QueryLongJob": ZStackRestRoute("GET", "v1/longjobs"),
+    "QueryManagementNode": ZStackRestRoute("GET", "v1/management-nodes"),
+    "QueryPolicy": ZStackRestRoute("GET", "v1/accounts/policies"),
+    "QueryPortForwardingRule": ZStackRestRoute("GET", "v1/port-forwarding"),
+    "QueryPrimaryStorage": ZStackRestRoute("GET", "v1/primary-storage"),
+    "QueryRole": ZStackRestRoute("GET", "v1/identities/roles"),
+    "QuerySecurityGroup": ZStackRestRoute("GET", "v1/security-groups"),
+    "QuerySftpBackupStorage": ZStackRestRoute("GET", "v1/backup-storage/sftp"),
+    "QuerySystemTag": ZStackRestRoute("GET", "v1/system-tags"),
+    "QueryUser": ZStackRestRoute("GET", "v1/accounts/users"),
+    "QueryUserTag": ZStackRestRoute("GET", "v1/user-tags"),
+    "QueryVip": ZStackRestRoute("GET", "v1/vips"),
+    "QueryVirtualRouterOffering": ZStackRestRoute("GET", "v1/instance-offerings/virtual-routers"),
+    "QueryVirtualRouterVm": ZStackRestRoute("GET", "v1/vm-instances/appliances/virtual-routers"),
+    "QueryVmInstance": ZStackRestRoute("GET", "v1/vm-instances"),
+    "QueryVmNic": ZStackRestRoute("GET", "v1/vm-instances/nics"),
+    "QueryVolume": ZStackRestRoute("GET", "v1/volumes"),
+    "QueryVolumeSnapshot": ZStackRestRoute("GET", "v1/volume-snapshots"),
+    "QueryVRouterRouteEntry": ZStackRestRoute("GET", "v1/vrouter-route-tables/route-entries"),
+    "QueryVRouterRouteTable": ZStackRestRoute("GET", "v1/vrouter-route-tables"),
+    "QueryZone": ZStackRestRoute("GET", "v1/zones"),
+}
+
+
 class ZStackClient:
     """
     ZStack API 客户端
     
     认证方式（按优先级）:
     1. 如果设置了 ZSTACK_SESSION_ID，直接使用该 Session
-    2. 否则使用 ZSTACK_ACCOUNT + ZSTACK_PASSWORD 登录获取 Session
+    2. 如果设置了 ZSTACK_ACCESS_KEY_ID + ZSTACK_ACCESS_KEY_SECRET，使用 AK/SK 签名
+    3. 否则使用 ZSTACK_ACCOUNT + ZSTACK_PASSWORD 登录获取 Session
     """
     
     # 轮询 Job 的配置
@@ -58,6 +116,8 @@ class ZStackClient:
         account: Optional[str] = None,
         password: Optional[str] = None,
         session_id: Optional[str] = None,
+        access_key_id: Optional[str] = None,
+        access_key_secret: Optional[str] = None,
     ):
         """
         初始化 ZStack 客户端
@@ -67,13 +127,31 @@ class ZStackClient:
             account: 账户名（用户名密码认证时使用）
             password: 密码（明文，会自动进行 SHA512 加密）
             session_id: 直接传入的 Session UUID（优先级高于用户名密码）
+            access_key_id: AccessKey ID（AK/SK 认证时使用）
+            access_key_secret: AccessKey Secret（AK/SK 认证时使用）
         """
         self.api_url = api_url or os.environ.get('ZSTACK_API_URL', 'http://localhost:8080')
         self.account = account or os.environ.get('ZSTACK_ACCOUNT', 'admin')
         self.password = password or os.environ.get('ZSTACK_PASSWORD', '')
+        self.access_key_id = (
+            access_key_id
+            or os.environ.get('ZSTACK_ACCESS_KEY_ID', '')
+            or os.environ.get('ZSTACK_AK', '')
+        )
+        self.access_key_secret = (
+            access_key_secret
+            or os.environ.get('ZSTACK_ACCESS_KEY_SECRET', '')
+            or os.environ.get('ZSTACK_SK', '')
+        )
         
-        # 优先使用直接传入的 session_id
-        env_session_id = session_id or os.environ.get('ZSTACK_SESSION_ID', '')
+        # 显式传入 AK/SK 时不再回退环境变量里的 session，避免 HTTP 头凭据被进程级 session 覆盖。
+        explicit_access_key = access_key_id is not None or access_key_secret is not None
+        if session_id is not None:
+            env_session_id = session_id
+        elif explicit_access_key:
+            env_session_id = ''
+        else:
+            env_session_id = os.environ.get('ZSTACK_SESSION_ID', '')
         
         # 如果有 session_id，直接创建 session 对象
         if env_session_id:
@@ -95,6 +173,8 @@ class ZStackClient:
             if not self.session.account_uuid:
                 return "session_id"  # 直接传入的 session
             return "session"  # 登录获取的 session
+        if self.access_key_id or self.access_key_secret:
+            return "access_key"
         return "password"  # 需要密码登录
     
     async def _get_http_client(self) -> httpx.AsyncClient:
@@ -105,6 +185,9 @@ class ZStackClient:
     
     async def logout(self) -> None:
         """调用 LogOut API 销毁当前 session，然后关闭 HTTP 客户端"""
+        if self.auth_mode == "access_key":
+            await self.close()
+            return
         if self.session and self.session.uuid:
             try:
                 await self.execute(
@@ -127,6 +210,203 @@ class ZStackClient:
     def _sha512(text: str) -> str:
         """SHA512 加密"""
         return hashlib.sha512(text.encode('utf-8')).hexdigest()
+
+    @staticmethod
+    def _format_access_key_date() -> str:
+        """返回 ZStack AK/SK 签名使用的本地时区 Date 字符串。"""
+        now = datetime.now().astimezone()
+        zone_name = now.strftime("%Z")
+        if zone_name:
+            return now.strftime("%a, %d %b %Y %H:%M:%S %Z")
+        return format_datetime(datetime.now(timezone.utc), usegmt=True)
+
+    @staticmethod
+    def _canonical_access_key_uri(url: str) -> str:
+        """按 ZStack Go SDK 规则提取签名用 URI：去掉 /zstack context path 和 query。"""
+        parsed = urlparse(url)
+        path = parsed.path or "/"
+        context_path = "/zstack"
+        idx = path.find(context_path)
+        if idx >= 0:
+            uri = path[idx + len(context_path):]
+            return uri or "/"
+        return path
+
+    def _validate_access_key(self) -> None:
+        if not self.access_key_id or not self.access_key_secret:
+            raise ZStackApiError(
+                "AK/SK 未配置完整，请同时设置 ZSTACK_ACCESS_KEY_ID 和 "
+                "ZSTACK_ACCESS_KEY_SECRET，或通过 HTTP 头传入 "
+                "X-ZStack-Access-Key-Id / X-ZStack-Access-Key-Secret"
+            )
+
+    def _access_key_auth_headers(
+        self,
+        method: str,
+        url: str,
+        date: Optional[str] = None,
+    ) -> dict[str, str]:
+        """生成 ZStack AK/SK 请求签名头。
+
+        签名算法参考 zstack-sdk-go-v2:
+        base64(hmac-sha1(secret, METHOD + "\n" + Date + "\n" + uri))
+        """
+        self._validate_access_key()
+        date = date or self._format_access_key_date()
+        method = method.upper()
+        uri = self._canonical_access_key_uri(url)
+        string_to_sign = f"{method}\n{date}\n{uri}"
+        digest = hmac.new(
+            self.access_key_secret.encode("utf-8"),
+            string_to_sign.encode("utf-8"),
+            hashlib.sha1,
+        ).digest()
+        signature = base64.b64encode(digest).decode("ascii")
+        return {
+            "Authorization": f"ZStack {self.access_key_id}:{signature}",
+            "Date": date,
+        }
+
+    def _request_headers(self, method: str, url: str) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if self.auth_mode == "access_key":
+            headers.update(self._access_key_auth_headers(method, url))
+        return headers
+
+    def _rest_url(self, path: str) -> str:
+        return f"{self.api_url.rstrip('/')}/zstack/{path.lstrip('/')}"
+
+    @staticmethod
+    def _rest_query_value(value: Any) -> str:
+        if isinstance(value, bool):
+            return str(value).lower()
+        if isinstance(value, (list, tuple, set)):
+            return ",".join(str(item) for item in value)
+        return str(value)
+
+    @classmethod
+    def _rest_condition_to_q(cls, condition: Any) -> Optional[str]:
+        if isinstance(condition, str):
+            return condition.strip() or None
+        if not isinstance(condition, dict):
+            return None
+        name = condition.get("name")
+        value = condition.get("value")
+        if name is None or value is None:
+            return None
+        op = str(condition.get("op") or "=").strip()
+        if op == "==":
+            op = "="
+        return f"{name}{op}{cls._rest_query_value(value)}"
+
+    @classmethod
+    def _rest_query_params(cls, parameters: dict[str, Any]) -> dict[str, Any]:
+        query: dict[str, Any] = {}
+        passthrough_keys = (
+            "limit",
+            "start",
+            "replyWithCount",
+            "count",
+            "groupBy",
+            "filterName",
+            "sort",
+        )
+        for key in passthrough_keys:
+            if key in parameters and parameters[key] is not None:
+                query[key] = cls._rest_query_value(parameters[key])
+
+        fields = parameters.get("fields")
+        if fields:
+            query["fields"] = cls._rest_query_value(fields)
+
+        q_values: list[str] = []
+        raw_q = parameters.get("q")
+        if isinstance(raw_q, str):
+            q_values.append(raw_q)
+        elif isinstance(raw_q, (list, tuple, set)):
+            q_values.extend(str(item) for item in raw_q if item is not None)
+
+        conditions = parameters.get("conditions")
+        if isinstance(conditions, dict):
+            conditions = [conditions]
+        if isinstance(conditions, (list, tuple)):
+            for condition in conditions:
+                q = cls._rest_condition_to_q(condition)
+                if q:
+                    q_values.append(q)
+        if q_values:
+            query["q"] = q_values
+
+        return query
+
+    def _rest_route_for_api(self, api_name: str) -> ZStackRestRoute:
+        route = REST_API_ROUTES.get(api_name)
+        if route is None:
+            raise ZStackApiError(
+                message=(
+                    f"AK/SK 认证不支持 /zstack/api/ message API，且当前未配置 "
+                    f"{api_name} 的 REST 路由映射"
+                ),
+                code="REST_MAPPING_NOT_FOUND",
+                details={
+                    "apiName": api_name,
+                    "authMode": "access_key",
+                    "hint": "请为该 API 增加 REST path/method 映射，或改用账号密码/session 认证。",
+                },
+            )
+        return route
+
+    async def execute_rest(
+        self,
+        api_name: str,
+        parameters: dict[str, Any],
+    ) -> dict[str, Any]:
+        """使用 REST API 执行 AK/SK 请求。"""
+        route = self._rest_route_for_api(api_name)
+        if route.method != "GET":
+            raise ZStackApiError(
+                message=f"AK/SK REST 路由 {api_name} 的方法 {route.method} 暂未实现",
+                code="REST_METHOD_NOT_IMPLEMENTED",
+                details={"apiName": api_name, "method": route.method, "path": route.path},
+            )
+
+        url = self._rest_url(route.path)
+        query = self._rest_query_params(parameters)
+        if query:
+            url = f"{url}?{urlencode(query, doseq=True)}"
+
+        client = await self._get_http_client()
+        response = await client.get(
+            url,
+            headers=self._request_headers(route.method, url),
+        )
+        if response.status_code >= 400:
+            raise ZStackApiError(
+                message=f"HTTP 错误 {response.status_code}: {response.text[:500]}",
+                code=str(response.status_code),
+            )
+
+        try:
+            result = response.json()
+        except Exception as e:
+            raise ZStackApiError(
+                message=f"响应解析失败: {str(e)}, 响应内容: {response.text[:500]}",
+            )
+
+        if isinstance(result, list):
+            return {"inventories": result}
+        if isinstance(result, dict):
+            if "error" in result:
+                error = result["error"]
+                if isinstance(error, dict):
+                    raise ZStackApiError(
+                        message=error.get("description", "请求失败"),
+                        code=error.get("code"),
+                        details=error,
+                    )
+                raise ZStackApiError(message=str(error or "请求失败"))
+            return result
+        return {"raw": result}
 
     @staticmethod
     def _normalize_metric_time(value: Any) -> Any:
@@ -300,7 +580,7 @@ class ZStackClient:
         return 'session' in message and ('invalid' in message or 'expired' in message)
 
     def _can_refresh_session(self) -> bool:
-        if self.auth_mode == "session_id":
+        if self.auth_mode in ("session_id", "access_key"):
             return False
         return bool(self.password)
 
@@ -315,8 +595,14 @@ class ZStackClient:
         Returns:
             ZStackSession 对象
         """
+        if self.auth_mode == "access_key":
+            raise ZStackApiError("AK/SK 认证不需要登录，请直接执行 API")
         if not self.password:
-            raise ZStackApiError("密码未配置，请设置 ZSTACK_PASSWORD 环境变量，或设置 ZSTACK_SESSION_ID 直接使用已有会话")
+            raise ZStackApiError(
+                "密码未配置，请设置 ZSTACK_PASSWORD 环境变量，"
+                "或设置 ZSTACK_SESSION_ID 直接使用已有会话，"
+                "或设置 ZSTACK_ACCESS_KEY_ID + ZSTACK_ACCESS_KEY_SECRET 使用 AK/SK 认证"
+            )
         
         password_hash = self._sha512(self.password)
         
@@ -331,7 +617,7 @@ class ZStackClient:
         response = await client.post(
             self.api_endpoint,
             json=request_body,
-            headers={"Content-Type": "application/json"}
+            headers=self._request_headers("POST", self.api_endpoint)
         )
         
         # 检查 HTTP 状态码
@@ -387,11 +673,17 @@ class ZStackClient:
         Returns:
             API 返回结果
         """
+        if self.auth_mode == "access_key":
+            return await self.execute_rest(api_name, parameters)
+
         base_parameters = dict(parameters)
 
         async def send_once() -> dict[str, Any]:
             # 确保已登录（除了登录 API 本身）
-            if 'LogIn' not in api_name:
+            if self.auth_mode == "access_key":
+                self._validate_access_key()
+                request_parameters = base_parameters
+            elif 'LogIn' not in api_name:
                 session = await self.ensure_session()
                 # 添加 session 信息
                 request_parameters = {
@@ -410,7 +702,7 @@ class ZStackClient:
             response = await client.post(
                 self.api_endpoint,
                 json=request_body,
-                headers={"Content-Type": "application/json"}
+                headers=self._request_headers("POST", self.api_endpoint)
             )
             
             # 检查 HTTP 状态码
@@ -470,7 +762,7 @@ class ZStackClient:
             
             response = await client.get(
                 job_location,
-                headers={"Content-Type": "application/json"}
+                headers=self._request_headers("GET", job_location)
             )
             
             # 检查 HTTP 状态码
@@ -537,9 +829,20 @@ class ZStackClient:
         labels = self._normalize_metric_labels(labels)
 
         async def send_once() -> dict[str, Any]:
-            session = await self.ensure_session()
+            if self.auth_mode == "access_key":
+                raise ZStackApiError(
+                    message=(
+                        "AK/SK 认证不支持 /zstack/api/ message API，"
+                        "get_metric_data 暂未配置 REST 路由映射"
+                    ),
+                    code="REST_MAPPING_NOT_FOUND",
+                    details={
+                        "apiName": "GetMetricData",
+                        "authMode": "access_key",
+                        "hint": "请为 GetMetricData 增加 REST path/method/parameter 映射，或改用账号密码/session 认证。",
+                    },
+                )
             payload = {
-                "session": {"uuid": session.uuid},
                 "namespace": namespace,
                 "metricName": metric_name,
                 "startTime": start_time,
@@ -547,6 +850,8 @@ class ZStackClient:
                 "period": period,
                 "labels": labels,
             }
+            session = await self.ensure_session()
+            payload["session"] = {"uuid": session.uuid}
             payload = {key: value for key, value in payload.items() if value is not None}
             request_body = {
                 "org.zstack.zwatch.api.APIGetMetricDataMsg": payload
@@ -556,7 +861,7 @@ class ZStackClient:
             response = await client.post(
                 self.api_endpoint,
                 json=request_body,
-                headers={"Content-Type": "application/json"}
+                headers=self._request_headers("POST", self.api_endpoint)
             )
             
             # 检查 HTTP 状态码

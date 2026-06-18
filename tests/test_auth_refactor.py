@@ -5,6 +5,7 @@
 2. cache_key 从 account 改为 api_url|account（多环境隔离）
 3. execute_api 通过 ctx: Context 从 HTTP 头取认证（用 mock ctx）
 4. 多环境：同一账号不同 api_url → 各自独立 session
+5. AK/SK：从 HTTP 头或环境变量传入 AccessKey/SecretKey，且不触发登录
 
 运行方式：
     pytest tests/test_auth_refactor.py -v
@@ -70,7 +71,14 @@ def _skip_if_unreachable(env_key: str):
 # 工具函数
 # ---------------------------------------------------------------------------
 
-def _make_mock_ctx(account: str, password: str, api_url: str, session_id: str = "") -> MagicMock:
+def _make_mock_ctx(
+    account: str,
+    password: str,
+    api_url: str,
+    session_id: str = "",
+    access_key_id: str = "",
+    access_key_secret: str = "",
+) -> MagicMock:
     """构造一个带 HTTP headers 的 mock FastMCP Context"""
     headers = {
         "x-zstack-account": account,
@@ -79,6 +87,10 @@ def _make_mock_ctx(account: str, password: str, api_url: str, session_id: str = 
     }
     if session_id:
         headers["x-zstack-session-id"] = session_id
+    if access_key_id:
+        headers["x-zstack-access-key-id"] = access_key_id
+    if access_key_secret:
+        headers["x-zstack-access-key-secret"] = access_key_secret
 
     mock_request = MagicMock()
     mock_request.headers = headers
@@ -88,7 +100,16 @@ def _make_mock_ctx(account: str, password: str, api_url: str, session_id: str = 
 
 
 def _clear_auth_env():
-    for key in ("ZSTACK_ACCOUNT", "ZSTACK_PASSWORD", "ZSTACK_SESSION_ID", "ZSTACK_API_URL"):
+    for key in (
+        "ZSTACK_ACCOUNT",
+        "ZSTACK_PASSWORD",
+        "ZSTACK_SESSION_ID",
+        "ZSTACK_ACCESS_KEY_ID",
+        "ZSTACK_ACCESS_KEY_SECRET",
+        "ZSTACK_AK",
+        "ZSTACK_SK",
+        "ZSTACK_API_URL",
+    ):
         os.environ.pop(key, None)
 
 
@@ -116,6 +137,22 @@ def test_extract_auth_with_session_id():
     assert auth.api_url == "http://172.20.0.37:8080"
 
 
+def test_extract_auth_with_access_key():
+    """HTTP 模式：包含 AK/SK 时正确提取"""
+    ctx = _make_mock_ctx(
+        "",
+        "",
+        "http://172.20.0.37:8080",
+        access_key_id="ak-123",
+        access_key_secret="sk-456",
+    )
+    auth = _extract_auth_from_context(ctx)
+
+    assert auth.access_key_id == "ak-123"
+    assert auth.access_key_secret == "sk-456"
+    assert auth.api_url == "http://172.20.0.37:8080"
+
+
 def test_extract_auth_from_stdio_context():
     """stdio 模式（无 HTTP request context）：安全返回全空"""
     class _StdioCtx:
@@ -127,6 +164,8 @@ def test_extract_auth_from_stdio_context():
     assert auth.account is None
     assert auth.password is None
     assert auth.session_id is None
+    assert auth.access_key_id is None
+    assert auth.access_key_secret is None
     assert auth.api_url is None
 
 
@@ -154,6 +193,59 @@ async def test_no_credentials_error():
     mgr = _SessionManager(max_sessions=3)
     with pytest.raises(ZStackApiError, match="缺少认证凭据"):
         await mgr.get_client()
+
+
+@pytest.mark.anyio
+async def test_access_key_client_uses_cache_without_login():
+    """AK/SK 模式不登录，按 api_url + access_key_id 缓存 client"""
+    _clear_auth_env()
+    mgr = _SessionManager(max_sessions=3)
+    try:
+        client1 = await mgr.get_client(
+            access_key_id="ak-123",
+            access_key_secret="sk-456",
+            api_url="http://dev1:8080",
+        )
+        client2 = await mgr.get_client(
+            access_key_id="ak-123",
+            access_key_secret="sk-456",
+            api_url="http://dev1:8080",
+        )
+
+        assert client1 is client2
+        assert client1.auth_mode == "access_key"
+        assert client1.session is None
+        assert len(mgr._clients) == 1
+    finally:
+        await mgr.logout_all()
+
+
+@pytest.mark.anyio
+async def test_access_key_env_fallback():
+    """stdio/env 模式可使用 ZSTACK_ACCESS_KEY_ID + ZSTACK_ACCESS_KEY_SECRET"""
+    _clear_auth_env()
+    os.environ["ZSTACK_API_URL"] = "http://dev1:8080"
+    os.environ["ZSTACK_ACCESS_KEY_ID"] = "ak-env"
+    os.environ["ZSTACK_ACCESS_KEY_SECRET"] = "sk-env"
+
+    mgr = _SessionManager(max_sessions=3)
+    try:
+        client = await mgr.get_client()
+        assert client.auth_mode == "access_key"
+        assert client.access_key_id == "ak-env"
+        assert client.access_key_secret == "sk-env"
+    finally:
+        await mgr.logout_all()
+        _clear_auth_env()
+
+
+@pytest.mark.anyio
+async def test_access_key_requires_id_and_secret():
+    """AK/SK 必须成对传入"""
+    _clear_auth_env()
+    mgr = _SessionManager(max_sessions=3)
+    with pytest.raises(ZStackApiError, match="AK/SK"):
+        await mgr.get_client(access_key_id="ak-only")
 
 
 # ---------------------------------------------------------------------------
