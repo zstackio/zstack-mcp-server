@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import atexit
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -76,6 +77,8 @@ class RequestAuth:
     account: Optional[str] = None
     password: Optional[str] = None
     session_id: Optional[str] = None
+    access_key_id: Optional[str] = None
+    access_key_secret: Optional[str] = None
     api_url: Optional[str] = None
 
 
@@ -92,6 +95,16 @@ def _extract_auth_from_context(ctx: Context) -> RequestAuth:
         auth.account = headers.get("x-zstack-account") or None
         auth.password = headers.get("x-zstack-password") or None
         auth.session_id = headers.get("x-zstack-session-id") or None
+        auth.access_key_id = (
+            headers.get("x-zstack-access-key-id")
+            or headers.get("x-zstack-ak")
+            or None
+        )
+        auth.access_key_secret = (
+            headers.get("x-zstack-access-key-secret")
+            or headers.get("x-zstack-sk")
+            or None
+        )
         auth.api_url = headers.get("x-zstack-api-url") or None
     except Exception:
         # stdio 模式或其他无 HTTP request 的场景，安全忽略
@@ -111,6 +124,8 @@ class _SessionManager:
         account: Optional[str] = None,
         password: Optional[str] = None,
         session_id: Optional[str] = None,
+        access_key_id: Optional[str] = None,
+        access_key_secret: Optional[str] = None,
         api_url: Optional[str] = None,
     ) -> ZStackClient:
         """获取 client，优先用缓存的 session
@@ -120,46 +135,115 @@ class _SessionManager:
         """
         # 确定凭据来源
         env_session_id = os.environ.get("ZSTACK_SESSION_ID", "")
+        env_access_key_id = os.environ.get("ZSTACK_ACCESS_KEY_ID", "") or os.environ.get("ZSTACK_AK", "")
+        env_access_key_secret = os.environ.get("ZSTACK_ACCESS_KEY_SECRET", "") or os.environ.get("ZSTACK_SK", "")
         env_account = os.environ.get("ZSTACK_ACCOUNT", "")
         env_password = os.environ.get("ZSTACK_PASSWORD", "")
         env_api_url = os.environ.get("ZSTACK_API_URL", "")
 
-        effective_session_id = session_id or env_session_id
-        effective_account = account or env_account
-        effective_password = password or env_password
         effective_api_url = api_url or env_api_url or None
 
-        # 如果有 session_id（参数传入或环境变量）且没有传账号密码 → 直接用 session_id
-        if effective_session_id and not account and not password:
-            cache_key = f"__session_id__{effective_api_url or ''}|{effective_session_id}"
+        request_session = bool(session_id)
+        request_access_key = bool(access_key_id or access_key_secret)
+        request_account = bool(account or password)
+
+        # HTTP 头中的凭据优先于环境变量；同一认证方式内允许从环境变量补齐另一半。
+        if request_session:
+            cache_key = f"__session_id__{effective_api_url or ''}|{session_id}"
             if cache_key in self._clients:
                 self._clients.move_to_end(cache_key)
                 return self._clients[cache_key]
-            client = ZStackClient(session_id=effective_session_id, api_url=effective_api_url)
-            self._clients[cache_key] = client
-            return client
+            client = ZStackClient(session_id=session_id, api_url=effective_api_url)
+            return await self._cache_client(cache_key, client)
 
+        if request_access_key:
+            effective_access_key_id = access_key_id or env_access_key_id
+            effective_access_key_secret = access_key_secret or env_access_key_secret
+            return await self._get_access_key_client(
+                effective_api_url,
+                effective_access_key_id,
+                effective_access_key_secret,
+            )
+
+        if request_account:
+            effective_account = account or env_account
+            effective_password = password or env_password
+            return await self._get_password_client(effective_api_url, effective_account, effective_password)
+
+        # 无 HTTP 凭据时回退环境变量，认证优先级：Session ID > AK/SK > 账号密码。
+        if env_session_id:
+            cache_key = f"__session_id__{effective_api_url or ''}|{env_session_id}"
+            if cache_key in self._clients:
+                self._clients.move_to_end(cache_key)
+                return self._clients[cache_key]
+            client = ZStackClient(session_id=env_session_id, api_url=effective_api_url)
+            return await self._cache_client(cache_key, client)
+
+        if env_access_key_id or env_access_key_secret:
+            return await self._get_access_key_client(
+                effective_api_url,
+                env_access_key_id,
+                env_access_key_secret,
+            )
+
+        return await self._get_password_client(effective_api_url, env_account, env_password)
+
+    async def _get_access_key_client(
+        self,
+        api_url: Optional[str],
+        access_key_id: Optional[str],
+        access_key_secret: Optional[str],
+    ) -> ZStackClient:
+        if not access_key_id or not access_key_secret:
+            raise ZStackApiError(
+                "缺少 AK/SK 认证凭据。请同时传入 X-ZStack-Access-Key-Id / "
+                "X-ZStack-Access-Key-Secret，或设置环境变量 "
+                "ZSTACK_ACCESS_KEY_ID + ZSTACK_ACCESS_KEY_SECRET"
+            )
+
+        secret_fingerprint = hashlib.sha256(access_key_secret.encode("utf-8")).hexdigest()[:16]
+        cache_key = f"__access_key__{api_url or ''}|{access_key_id}|{secret_fingerprint}"
+        if cache_key in self._clients:
+            self._clients.move_to_end(cache_key)
+            return self._clients[cache_key]
+
+        client = ZStackClient(
+            access_key_id=access_key_id,
+            access_key_secret=access_key_secret,
+            api_url=api_url,
+        )
+        return await self._cache_client(cache_key, client)
+
+    async def _get_password_client(
+        self,
+        api_url: Optional[str],
+        account: Optional[str],
+        password: Optional[str],
+    ) -> ZStackClient:
         # 必须有凭据
-        if not effective_account or not effective_password:
+        if not account or not password:
             raise ZStackApiError(
                 "缺少认证凭据。请通过 HTTP 头传入 X-ZStack-Account/X-ZStack-Password，"
                 "或设置环境变量 ZSTACK_ACCOUNT + ZSTACK_PASSWORD，"
-                "或设置 ZSTACK_SESSION_ID / X-ZStack-Session-Id 直接使用已有会话"
+                "或设置 ZSTACK_SESSION_ID / X-ZStack-Session-Id 直接使用已有会话，"
+                "或设置 ZSTACK_ACCESS_KEY_ID + ZSTACK_ACCESS_KEY_SECRET 使用 AK/SK 认证"
             )
 
-        cache_key = f"{effective_api_url or ''}|{effective_account}"
+        cache_key = f"{api_url or ''}|{account}"
         if cache_key in self._clients:
             self._clients.move_to_end(cache_key)
             return self._clients[cache_key]
 
         # 缓存未命中 → 创建新 client 并登录
         client = ZStackClient(
-            account=effective_account,
-            password=effective_password,
-            api_url=effective_api_url,
+            account=account,
+            password=password,
+            api_url=api_url,
         )
         await client.login()
+        return await self._cache_client(cache_key, client)
 
+    async def _cache_client(self, cache_key: str, client: ZStackClient) -> ZStackClient:
         # 超过上限 → 淘汰最早的
         while len(self._clients) >= self._max_sessions:
             _, old_client = self._clients.popitem(last=False)
@@ -951,6 +1035,8 @@ async def execute_api(
             account=auth.account,
             password=auth.password,
             session_id=auth.session_id,
+            access_key_id=auth.access_key_id,
+            access_key_secret=auth.access_key_secret,
             api_url=auth.api_url,
         )
         is_async = api_info.call_type == 'async'
@@ -1173,6 +1259,8 @@ async def get_metric_data(
             account=auth.account,
             password=auth.password,
             session_id=auth.session_id,
+            access_key_id=auth.access_key_id,
+            access_key_secret=auth.access_key_secret,
             api_url=auth.api_url,
         )
         result = await client.query_metric_data(
@@ -1277,6 +1365,8 @@ async def get_metric_summary(
             account=auth.account,
             password=auth.password,
             session_id=auth.session_id,
+            access_key_id=auth.access_key_id,
+            access_key_secret=auth.access_key_secret,
             api_url=auth.api_url,
         )
         metrics = []
@@ -1656,4 +1746,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

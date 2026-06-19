@@ -37,6 +37,10 @@ export ZSTACK_PASSWORD="your-password"          # 密码（明文）
 # 认证方式二：直接传入 SessionID（优先级更高，设置后忽略用户名密码）
 export ZSTACK_SESSION_ID="your-session-uuid"    # 已有的 Session UUID
 
+# 认证方式三：AK/SK（AccessKey/SecretKey，请求签名认证）
+export ZSTACK_ACCESS_KEY_ID="your-access-key-id"
+export ZSTACK_ACCESS_KEY_SECRET="your-access-key-secret"
+
 # 查询响应控制（可选）
 export ZSTACK_QUERY_DEFAULT_LIMIT="50"          # Query API 默认 limit（设 0 禁用）
 export ZSTACK_RESPONSE_SIZE_LIMIT="65536"       # 响应大小上限，字节（设 0 禁用）
@@ -48,8 +52,10 @@ export ZSTACK_RESPONSE_SIZE_LIMIT="65536"       # 响应大小上限，字节（
 |------|----------|------|
 | 用户名密码 | `ZSTACK_ACCOUNT` + `ZSTACK_PASSWORD` | 自动登录获取 Session |
 | Session ID | `ZSTACK_SESSION_ID` | 直接使用已有 Session（优先级更高） |
+| AK/SK | `ZSTACK_ACCESS_KEY_ID` + `ZSTACK_ACCESS_KEY_SECRET` | 通过 REST API 签名调用，不创建 Session |
 
-> 💡 如果同时设置了 `ZSTACK_SESSION_ID` 和用户名密码，会优先使用 Session ID
+> 💡 环境变量同时存在时优先级为：`ZSTACK_SESSION_ID` > AK/SK > 用户名密码
+> AK/SK 只适用于已配置 REST 路由映射的 API。未映射的 API 会返回 `REST_MAPPING_NOT_FOUND`，不会回退调用 `/zstack/api/` message API。
 
 ### 安全说明
 
@@ -141,9 +147,11 @@ uvx zstack-mcp-server
 | `X-ZStack-Account` | `ZSTACK_ACCOUNT` | 账户名 |
 | `X-ZStack-Password` | `ZSTACK_PASSWORD` | 密码 |
 | `X-ZStack-Session-Id` | `ZSTACK_SESSION_ID` | 已有 Session（优先级高于账号密码） |
+| `X-ZStack-Access-Key-Id` | `ZSTACK_ACCESS_KEY_ID` | AccessKey ID |
+| `X-ZStack-Access-Key-Secret` | `ZSTACK_ACCESS_KEY_SECRET` | AccessKey Secret |
 | `X-ZStack-API-URL` | `ZSTACK_API_URL` | ZStack 管理节点地址（可代理多套环境） |
 
-凭据优先级：HTTP 头 > 环境变量
+凭据优先级：HTTP 头 > 环境变量；同一来源内优先级为 Session ID > AK/SK > 用户名密码。
 
 典型用法：
 ```bash
@@ -211,6 +219,30 @@ ZSTACK_ALLOW_ALL_API=false uvx zstack-mcp-server --transport streamable-http --h
   }
 }
 ```
+
+**方式三：使用 AK/SK**
+```json
+{
+  "mcpServers": {
+    "zstack": {
+      "command": "uvx",
+      "args": ["zstack-mcp-server"],
+      "env": {
+        "ZSTACK_API_URL": "http://your-zstack-server:8080",
+        "ZSTACK_ACCESS_KEY_ID": "your-access-key-id",
+        "ZSTACK_ACCESS_KEY_SECRET": "your-access-key-secret",
+        "ZSTACK_ALLOW_ALL_API": "false"
+      }
+    }
+  }
+}
+```
+
+AK/SK 模式下，MCP Server 会将已映射的 Query API 转为 REST GET 请求，例如：
+- `QueryZone` → `GET /zstack/v1/zones`
+- `QueryVmInstance` → `GET /zstack/v1/vm-instances`
+
+未映射的 API 会返回明确错误，避免误打 `/zstack/api/` 后触发缺少 session 的 `ID.1001`。
 
 > 💡 将 `ZSTACK_ALLOW_ALL_API` 设为 `"true"` 可启用写操作（创建/删除/修改等）
 
@@ -349,4 +381,3 @@ pytest
 ## License
 
 MIT
-
